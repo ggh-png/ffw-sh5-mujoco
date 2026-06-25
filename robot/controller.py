@@ -1,33 +1,30 @@
 """FFW-SH5 MuJoCo Teleoperation Controller.
 
-Base movement
--------------
-UP / DOWN     Forward / backward (body-frame)
-LEFT / RIGHT  Yaw left / right
-Q / E         Lift up / down
+Base
+  UP/DN       Forward / backward
+  LT/RT       Yaw left / right
+  Q/E         Lift up / down
 
 IK mode (default)
------------------
-I / K         EE forward / backward
-J / L         EE lateral left / right
-U / O         EE up / down
-hold 1        Left arm only
-hold 2        Right arm only
+  I/K J/L U/O   EE fwd/bk  lat  up/dn
+  hold 1         Left arm only
+  hold 2         Right arm only
 
-FK mode
--------
-Tab           Toggle FK / IK
-1 / 2         Select left / right arm
-[ / ]         Cycle joint J1..J7
-I / K         Adjust selected joint angle
+FK mode  (Tab to toggle)
+  1/2           Select left / right arm
+  [/]           Cycle joint J1..J7
+  I/K           Adjust selected joint
+  Home/End/Del  Jump to max / min / zero
+
+Hand
+  Z / C         Left hand  close / open
+  X / V         Right hand close / open
 
 Common
-------
-Z / X         Left / right grip toggle
-F             Camera-follow toggle
-G             Gizmo toggle
-R             Reset can
-F11           Fullscreen toggle
+  F    Camera-follow toggle
+  G    Gizmo toggle
+  R    Reset can
+  F11  Fullscreen toggle
 """
 import math
 import time
@@ -36,7 +33,7 @@ import numpy as np
 import mujoco
 
 from .keystate import KeyState
-from .ik import dls_ik
+from .ik import qp_ik
 
 try:
     import glfw as _glfw
@@ -44,27 +41,28 @@ try:
 except ImportError:
     _HAS_GLFW = False
 
-# ── GLFW key codes (all ASCII-range keys) ──────────────────────────────
-_K: dict[str, int] = {c: ord(c) for c in 'QEIJKLUOZX12FGR'}
+# ── GLFW key codes ────────────────────────────────────────────────────────
+_K: dict[str, int] = {c: ord(c) for c in 'QEIJKLUOZXCV12FGR'}
 _K.update({
-    'UP':     265,   # forward
-    'DOWN':   264,   # backward
-    'LEFT':   263,   # yaw left
-    'RIGHT':  262,   # yaw right
+    'UP':     265,
+    'DOWN':   264,
+    'LEFT':   263,
+    'RIGHT':  262,
     'F11':    300,
     'TAB':    258,
-    'LBRACK': 91,    # [
-    'RBRACK': 93,    # ]
-    'HOME':   268,   # FK: joint → max
-    'END':    269,   # FK: joint → min
-    'DEL':    261,   # FK: joint → 0
+    'LBRACK': 91,
+    'RBRACK': 93,
+    'HOME':   268,
+    'END':    269,
+    'DEL':    261,
 })
 
-# ── Physical constants ──────────────────────────────────────────────────
+# ── Physical constants ────────────────────────────────────────────────────
 BASE_MAX_SPD  = 0.55   # m/s
 YAW_MAX_SPD   = 1.20   # rad/s
 IK_SPEED      = 0.40   # m/s
 FK_SPEED      = 0.80   # rad/s
+GRIP_SPEED    = 1.50   # full range (0→1) per second
 LIFT_STEP     = 0.003  # m per update
 WHEEL_RADIUS  = 0.090  # m
 K_ACCEL       = 3.0
@@ -90,15 +88,45 @@ ARM_R = [f'arm_r_joint{i}' for i in range(1, 8)]
 FIN_L = [f'finger_l_joint{i}' for i in range(1, 21)]
 FIN_R = [f'finger_r_joint{i}' for i in range(1, 21)]
 
-OPEN_ANGLE: dict[str, float] = {}
+# grip=0 → all joints at 0 (fingers fully extended / hand open)
+# grip=1 → joints curl to GRIP_CLOSE angles
+#
+# Joint layout (each hand has 20 joints):
+#   1        : thumb  base spread   [-90°, 90°]
+#   2        : thumb  MCP rotation  [0°, 180°]  ← keep fixed (0)
+#   3        : thumb  roll          [-90°,  0°]  ← close = -90° (L), +90° (R)
+#   4        : thumb  curl          [-90°,  0°]  ← close = -90° (L), +90° (R)
+#   5,9,13,17: finger abduction     [-35°, 35°]  ← keep at 0 (no spread)
+#   6,10,14,18: MCP flex            [0°, 115°]   ← close = ~100°
+#   7,11,15,19: PIP flex            [0°,  90°]   ← close = 90°
+#   8,12,16,20: DIP flex            [0°,  90°]   ← close = 90°
+GRIP_CLOSE: dict[str, float] = {}
+
 for _jn in FIN_L:
     _ix = int(_jn.split('joint')[1])
-    OPEN_ANGLE[_jn] = (math.pi / 2 if _ix == 2 else
-                       math.pi / 2 if _ix in (6, 10, 14, 18) else 0.0)
+    if _ix == 1:    GRIP_CLOSE[_jn] = 0.0                # thumb spread: neutral
+    elif _ix == 2:  GRIP_CLOSE[_jn] = 0.0                # thumb MCP rot: fixed
+    elif _ix == 3:  GRIP_CLOSE[_jn] = -math.pi / 2       # thumb roll close
+    elif _ix == 4:  GRIP_CLOSE[_jn] = -math.pi / 2       # thumb curl close
+    else:
+        _phase = (_ix - 5) % 4
+        if   _phase == 0: GRIP_CLOSE[_jn] = 0.0           # abduction: no change
+        elif _phase == 1: GRIP_CLOSE[_jn] = 1.7           # MCP ~97° (within 115°)
+        elif _phase == 2: GRIP_CLOSE[_jn] = math.pi / 2   # PIP 90°
+        else:             GRIP_CLOSE[_jn] = math.pi / 2   # DIP 90°
+
 for _jn in FIN_R:
     _ix = int(_jn.split('joint')[1])
-    OPEN_ANGLE[_jn] = (-math.pi / 2 if _ix == 2 else
-                        math.pi / 2 if _ix in (6, 10, 14, 18) else 0.0)
+    if _ix == 1:    GRIP_CLOSE[_jn] = 0.0
+    elif _ix == 2:  GRIP_CLOSE[_jn] = 0.0
+    elif _ix == 3:  GRIP_CLOSE[_jn] = math.pi / 2        # mirrored thumb roll
+    elif _ix == 4:  GRIP_CLOSE[_jn] = math.pi / 2        # mirrored thumb curl
+    else:
+        _phase = (_ix - 5) % 4
+        if   _phase == 0: GRIP_CLOSE[_jn] = 0.0
+        elif _phase == 1: GRIP_CLOSE[_jn] = 1.7
+        elif _phase == 2: GRIP_CLOSE[_jn] = math.pi / 2
+        else:             GRIP_CLOSE[_jn] = math.pi / 2
 
 
 # ── ASCII progress bar helpers ──────────────────────────────────────────
@@ -262,11 +290,9 @@ class TeleopController:
         self._fk_joint = 0
         self._fk_arm   = 'l'
 
-        # Grip state (0.0-1.0)
-        self._grip_l  = 0.0
-        self._grip_r  = 0.0
-        self._tgl_l_t = -99.0
-        self._tgl_r_t = -99.0
+        # Grip state (0=open, 1=closed)
+        self._grip_l = 0.0
+        self._grip_r = 0.0
 
         # Misc state
         self.show_gizmo  = True
@@ -308,6 +334,7 @@ class TeleopController:
         if self._can_qadr is not None:
             self._can_init_qpos = self.d.qpos[self._can_qadr: self._can_qadr + 7].copy()
 
+        # Fully open hand (grip=0 → all joints at 0)
         self._apply_grip('l', 0.0)
         self._apply_grip('r', 0.0)
         self._wall_t0 = time.perf_counter()
@@ -331,14 +358,6 @@ class TeleopController:
 
         self.ks.on_key(key)
         t = time.perf_counter()
-
-        # Grip toggle (full open ↔ full close)
-        if key == _K['Z'] and (t - self._tgl_l_t) > 0.3:
-            self._grip_l  = 0.0 if self._grip_l > 0.5 else 1.0
-            self._tgl_l_t = t
-        if key == _K['X'] and (t - self._tgl_r_t) > 0.3:
-            self._grip_r  = 0.0 if self._grip_r > 0.5 else 1.0
-            self._tgl_r_t = t
 
         # Mode switch
         if key == _K['TAB']:
@@ -390,7 +409,7 @@ class TeleopController:
         else:
             self._update_fk(dt)
 
-        self._update_grip()
+        self._update_grip(dt)
 
     # ── Base (kinematic pose + visual wheel animation) ────────────────────
 
@@ -480,7 +499,7 @@ class TeleopController:
             self._ik_tgt_r_base = self._clamp_ws(self._ik_tgt_r_base,
                                                    self._shoulder_r_bid)
 
-    # ── IK solver ────────────────────────────────────────────────────────
+    # ── IK solver (convex QP / BVLS) ────────────────────────────────────
 
     def _update_ik(self):
         mujoco.mj_forward(self.m, self.d)
@@ -493,10 +512,10 @@ class TeleopController:
         self.ee_pos_l = self.d.xpos[self._ee_l].copy()
         self.ee_pos_r = self.d.xpos[self._ee_r].copy()
 
-        self._ik_err_l = dls_ik(
+        self._ik_err_l = qp_ik(
             self.m, self.d, self._ee_l, tgt_l,
             self._jl_dadrs, self._jl_qadrs)
-        self._ik_err_r = dls_ik(
+        self._ik_err_r = qp_ik(
             self.m, self.d, self._ee_r, tgt_r,
             self._jr_dadrs, self._jr_qadrs)
 
@@ -556,46 +575,37 @@ class TeleopController:
         self.ik_world_tgt_l = self.ee_pos_l
         self.ik_world_tgt_r = self.ee_pos_r
 
-    # ── Grip ─────────────────────────────────────────────────────────────
+    # ── Grip (continuous, hold Z/C left  X/V right) ──────────────────────
 
-    def _update_grip(self):
+    def _update_grip(self, dt: float):
+        ks = self.ks
+        step = GRIP_SPEED * dt
+        # Left: Z=close  C=open
+        if ks.is_down(_K['Z']):
+            self._grip_l = min(1.0, self._grip_l + step)
+        elif ks.is_down(_K['C']):
+            self._grip_l = max(0.0, self._grip_l - step)
+        # Right: X=close  V=open
+        if ks.is_down(_K['X']):
+            self._grip_r = min(1.0, self._grip_r + step)
+        elif ks.is_down(_K['V']):
+            self._grip_r = max(0.0, self._grip_r - step)
+
         self._apply_grip('l', self._grip_l)
         self._apply_grip('r', self._grip_r)
 
     def _apply_grip(self, side: str, grip: float):
-        s    = 1.0 if side == 'l' else -1.0
-        fins = FIN_L if side == 'l' else FIN_R
+        """Apply grip ∈ [0,1] (0=fully open, 1=fully closed)."""
         info = self._fin_l_info if side == 'l' else self._fin_r_info
         act  = self._a_fin_l    if side == 'l' else self._a_fin_r
 
-        for jname in fins:
-            if jname not in info:
-                continue
+        for jname, (qadr, (lo, hi)) in info.items():
             a_id = act.get(jname)
             if a_id is None:
                 continue
-            qadr, (lo, hi) = info[jname]
-            idx      = int(jname.split('joint')[1])
-            open_val = OPEN_ANGLE.get(jname, 0.0)
-
-            if idx <= 4:
-                if idx == 2:
-                    target = open_val
-                elif idx in (3, 4):
-                    close  = s * (-math.pi / 3)
-                    target = open_val + (close - open_val) * grip
-                else:
-                    target = open_val
-            else:
-                phase = (idx - 5) % 4
-                if phase == 0:
-                    target = open_val - grip * 0.15
-                elif phase == 1:
-                    target = open_val + grip * (math.pi / 4)
-                else:
-                    target = open_val + grip * (math.pi / 3)
-
-            self.d.ctrl[a_id] = float(np.clip(target, lo, hi))
+            close_val = GRIP_CLOSE.get(jname, 0.0)
+            target = float(np.clip(close_val * grip, lo, hi))
+            self.d.ctrl[a_id] = target
 
     # ── Can reset ────────────────────────────────────────────────────────
 
@@ -791,11 +801,10 @@ class TeleopController:
         # Grip bars
         gl_pct = int(self._grip_l * 100)
         gr_pct = int(self._grip_r * 100)
-        # 0% grip is the normal open state; suppress near-limit warning
-        gl_bar = _pbar(self._grip_l, -0.01, 1.0, 12)[:-1] + ' '
-        gr_bar = _pbar(self._grip_r, -0.01, 1.0, 12)[:-1] + ' '
-        gl_str = 'GRIP' if self._grip_l > 0.5 else 'open'
-        gr_str = 'GRIP' if self._grip_r > 0.5 else 'open'
+        gl_bar = _pbar(self._grip_l, 0.0, 1.0, 12)[:-1] + ' '
+        gr_bar = _pbar(self._grip_r, 0.0, 1.0, 12)[:-1] + ' '
+        gl_str = 'CLOSED' if self._grip_l > 0.8 else ('GRIP' if self._grip_l > 0.1 else 'open')
+        gr_str = 'CLOSED' if self._grip_r > 0.8 else ('GRIP' if self._grip_r > 0.1 else 'open')
 
         return '\n'.join([
             '--- Telemetry ---',
@@ -809,9 +818,9 @@ class TeleopController:
             wrist_row('L', self._jl_qadrs, self._jl_ranges),
             wrist_row('R', self._jr_qadrs, self._jr_ranges),
             '',
-            '--- Hand ---',
-            f' L ({gl_str}) Z={gl_bar} {gl_pct:3d}%',
-            f' R ({gr_str}) X={gr_bar} {gr_pct:3d}%',
+            '--- Hand (Z/C=L-close/open  X/V=R) ---',
+            f' L ({gl_str}) {gl_bar} {gl_pct:3d}%',
+            f' R ({gr_str}) {gr_bar} {gr_pct:3d}%',
         ])
 
     # ── Panel: status ─────────────────────────────────────────────────────
@@ -867,7 +876,9 @@ class TeleopController:
             ' 1/2=arm  [/]=joint  I/K=angle',
             ' Home=max  End=min  Del=zero',
             '',
-            'Z/X=grip toggle',
-            'F=cam-follow  G=gizmo  R=reset-can',
-            'F11=fullscreen',
+            'Hand (hold key)',
+            ' Z=L-close  C=L-open',
+            ' X=R-close  V=R-open',
+            '',
+            'F=cam  G=gizmo  R=reset  F11=FS',
         ])

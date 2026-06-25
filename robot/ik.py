@@ -1,15 +1,19 @@
-"""Damped Least Squares (DLS) IK using MuJoCo's mj_jac().
+"""Bounded-Variable Least Squares (BVLS) IK — convex QP formulation.
 
-Δθ = J^T (J J^T + λ²I)^{-1} e
+Solves each iteration as a proper constrained QP:
+    min  ||J Δθ - e||² + λ||Δθ||²
+    s.t. θ_lo ≤ θ + Δθ ≤ θ_hi   (hard joint-limit constraints)
 
-mj_forward 는 함수 진입 전 1회만 호출된 것으로 가정.
-각 이터레이션마다 관절 업데이트 후 forward 를 재계산한다.
+Uses scipy.optimize.lsq_linear (BVLS algorithm) which guarantees the
+global optimum of each linearised sub-problem — unlike DLS+clamp which
+violates joint limits when clamping is needed.
 """
 import numpy as np
 import mujoco
+from scipy.optimize import lsq_linear
 
 
-def dls_ik(
+def qp_ik(
     model: mujoco.MjModel,
     data:  mujoco.MjData,
     ee_id:       int,
@@ -17,17 +21,22 @@ def dls_ik(
     dof_indices: list,
     qpos_addrs:  list,
     *,
-    n_iter:   int   = 12,
-    lam:      float = 0.01,
-    max_dq:   float = 0.20,
-    tol:      float = 1e-3,
+    n_iter:  int   = 15,
+    lam:     float = 0.005,   # Tikhonov regularisation
+    max_dq:  float = 0.30,    # per-step joint-velocity limit [rad]
+    tol:     float = 1e-3,    # position error tolerance [m]
 ) -> float:
-    """단일 호출 당 최대 n_iter 번 반복. 진입 전 mj_forward 호출 필요.
-    Returns final EE position error [m].
+    """Run ≤n_iter QP iterations.  Returns final ||error|| [m].
+
+    Call mj_forward() before the first invocation so Jacobians are valid.
     """
-    n    = len(dof_indices)
-    jacp = np.zeros((3, model.nv))
-    _jid_cache = _build_jid_cache(model, qpos_addrs)
+    n     = len(dof_indices)
+    jacp  = np.zeros((3, model.nv))
+    jids  = _jid_cache(model, qpos_addrs)
+
+    lo = np.array([model.jnt_range[jids[i]][0] for i in range(n)])
+    hi = np.array([model.jnt_range[jids[i]][1] for i in range(n)])
+    sq_lam = np.sqrt(lam)
 
     for _ in range(n_iter):
         ee_pos = data.xpos[ee_id].copy()
@@ -37,22 +46,38 @@ def dls_ik(
 
         jacp[:] = 0.0
         mujoco.mj_jac(model, data, jacp, None, ee_pos, ee_id)
-        J   = jacp[:, dof_indices]
-        JJT = J @ J.T + (lam ** 2) * np.eye(3)
-        dq  = J.T @ np.linalg.solve(JJT, err)
-        dq  = np.clip(dq, -max_dq, max_dq)
+        J = jacp[:, dof_indices]           # (3, n)
 
-        for i in range(n):
-            qadr    = qpos_addrs[i]
-            lo, hi  = model.jnt_range[_jid_cache[i]]
-            data.qpos[qadr] = float(np.clip(data.qpos[qadr] + dq[i], lo, hi))
+        # Augment system: [J; sqrt(λ)·I] dq = [e; 0]
+        J_aug = np.vstack([J, sq_lam * np.eye(n)])
+        e_aug = np.concatenate([err, np.zeros(n)])
+
+        # Per-step bound: clamp to [lo-θ, hi-θ] ∩ [-max_dq, max_dq]
+        q = np.array([data.qpos[a] for a in qpos_addrs])
+        dq_lo = np.maximum(lo - q, -max_dq)
+        dq_hi = np.minimum(hi - q,  max_dq)
+
+        try:
+            res = lsq_linear(J_aug, e_aug,
+                             bounds=(dq_lo, dq_hi),
+                             method='bvls', max_iter=40, tol=1e-7)
+            dq = res.x
+        except Exception:
+            # Fallback: unconstrained DLS + clamp
+            JJT = J @ J.T + lam * np.eye(3)
+            dq  = np.clip(J.T @ np.linalg.solve(JJT, err), dq_lo, dq_hi)
+
+        for i, qadr in enumerate(qpos_addrs):
+            data.qpos[qadr] = float(np.clip(data.qpos[qadr] + dq[i],
+                                            lo[i], hi[i]))
 
         mujoco.mj_forward(model, data)
 
     return float(np.linalg.norm(target_pos - data.xpos[ee_id]))
 
 
-def _build_jid_cache(model: mujoco.MjModel, qpos_addrs: list) -> list:
+def _jid_cache(model, qpos_addrs):
+    """Map qpos address → joint index."""
     cache = []
     for qadr in qpos_addrs:
         for j in range(model.njnt):
