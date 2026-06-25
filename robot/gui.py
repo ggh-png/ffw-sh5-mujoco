@@ -29,6 +29,9 @@ class ControlPanel:
     # ── Dear PyGui main loop ──────────────────────────────────────────────
 
     def _mainloop(self):
+        # Wait for MuJoCo viewer's GL context to be fully established before
+        # creating Dear PyGui's own GLFW/GL context to avoid EGL conflicts.
+        time.sleep(1.5)
         dpg.create_context()
         dpg.create_viewport(
             title='FFW-SH5 Control Panel',

@@ -101,7 +101,6 @@ def main():
     data  = mujoco.MjData(model)
 
     ctrl = TeleopController(model, data)
-    gui  = ControlPanel(ctrl)   # launches Dear PyGui in a daemon thread
 
     with mujoco.viewer.launch_passive(
         model, data,
@@ -110,6 +109,9 @@ def main():
         show_right_ui=False,
     ) as viewer:
         ctrl.reset()
+        # GUI must start AFTER MuJoCo viewer has claimed its GL/EGL context.
+        # Starting it before causes an EGL context conflict ("could not create window").
+        gui = ControlPanel(ctrl)
 
         frame_dt = 1.0 / RENDER_HZ
         prev_t   = time.perf_counter()
