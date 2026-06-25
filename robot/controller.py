@@ -1,31 +1,33 @@
 """FFW-SH5 MuJoCo Teleoperation Controller.
 
-Mode
-----
-Tab         FK / IK 모드 전환
+Base movement
+-------------
+UP / DOWN     Forward / backward (body-frame)
+LEFT / RIGHT  Yaw left / right
+Q / E         Lift up / down
 
-IK 모드 (기본)
---------------
-WASD        베이스 이동 (로봇 기준계)
-←/→         베이스 yaw 회전
-Q/E         리프트 상승/하강
-I/K J/L U/O IK EE 이동 (전/후, 좌/우, 상/하)
-hold 1      왼팔만
-hold 2      오른팔만
-Z/X         좌/우 그립 토글
+IK mode (default)
+-----------------
+I / K         EE forward / backward
+J / L         EE lateral left / right
+U / O         EE up / down
+hold 1        Left arm only
+hold 2        Right arm only
 
-FK 모드
+FK mode
 -------
-1/2         왼팔 / 오른팔 선택
-[/]         관절 선택 (J1 ↔ J7)
-I/K         선택 조인트 증가/감소
+Tab           Toggle FK / IK
+1 / 2         Select left / right arm
+[ / ]         Cycle joint J1..J7
+I / K         Adjust selected joint angle
 
-공통
-----
-F           카메라 추적 토글
-G           기즈모 토글
-R           캔 리셋
-F11         전체화면 토글
+Common
+------
+Z / X         Left / right grip toggle
+F             Camera-follow toggle
+G             Gizmo toggle
+R             Reset can
+F11           Fullscreen toggle
 """
 import math
 import time
@@ -42,30 +44,37 @@ try:
 except ImportError:
     _HAS_GLFW = False
 
-# ── GLFW key codes ──────────────────────────────────────────────────────
-_K: dict[str, int] = {c: ord(c) for c in 'WASDQEIJKLUOZX12FGR'}
+# ── GLFW key codes (all ASCII-range keys) ──────────────────────────────
+_K: dict[str, int] = {c: ord(c) for c in 'QEIJKLUOZX12FGR'}
 _K.update({
-    'LEFT':    263,
-    'RIGHT':   262,
-    'F11':     300,
-    'TAB':     258,
-    'LBRACK':  91,    # [
-    'RBRACK':  93,    # ]
+    'UP':     265,   # forward
+    'DOWN':   264,   # backward
+    'LEFT':   263,   # yaw left
+    'RIGHT':  262,   # yaw right
+    'F11':    300,
+    'TAB':    258,
+    'LBRACK': 91,    # [
+    'RBRACK': 93,    # ]
 })
 
-# ── 상수 ───────────────────────────────────────────────────────────────
+# ── Physical constants ──────────────────────────────────────────────────
 BASE_MAX_SPD  = 0.55   # m/s
 YAW_MAX_SPD   = 1.20   # rad/s
-LIFT_STEP     = 0.003  # m per frame (smooth)
 IK_SPEED      = 0.40   # m/s
 FK_SPEED      = 0.80   # rad/s
+LIFT_STEP     = 0.003  # m per update
 WHEEL_RADIUS  = 0.090  # m
-K_ACCEL       = 3.0    # m/s² 가속
-K_BRAKE       = 6.0    # m/s² 제동
+K_ACCEL       = 3.0
+K_BRAKE       = 6.0
 K_YAW_ACCEL   = 4.0
 K_YAW_BRAKE   = 8.0
-IK_WORKSPACE  = 0.78   # m (어깨 기준 최대 도달거리)
+IK_WORKSPACE  = 0.78   # m from shoulder
 EMA_ALPHA     = 0.05
+
+# IK target display ranges (base-frame, meters)
+IK_X_RANGE = (-0.50, 1.50)
+IK_Y_RANGE = (-1.00, 1.00)
+IK_Z_RANGE = ( 0.00, 2.00)
 
 WHEEL_XY = {
     'left':  np.array([ 0.1371,  0.2554]),
@@ -89,6 +98,50 @@ for _jn in FIN_R:
                         math.pi / 2 if _ix in (6, 10, 14, 18) else 0.0)
 
 
+# ── ASCII progress bar helpers ──────────────────────────────────────────
+
+def _pbar(val: float, lo: float, hi: float, w: int = 18) -> str:
+    """Return an ASCII progress bar of total length w+3.
+
+    '#' = cursor position
+    '|' = zero/centre marker (only when range spans zero)
+    '=' = filled region between zero and cursor
+    '-' = empty
+    trailing char: '*' if near limit, ' ' otherwise
+    """
+    if hi <= lo:
+        return '[' + '-' * w + '] '
+    pct = max(0.0, min(1.0, (val - lo) / (hi - lo)))
+    pos = int(round(pct * (w - 1)))
+
+    if lo < 0.0 < hi:
+        mid = int(round((-lo) / (hi - lo) * (w - 1)))
+    else:
+        mid = 0
+    mid = max(0, min(w - 1, mid))
+
+    bar = ['-'] * w
+    if pos >= mid:
+        for i in range(mid, pos + 1):
+            bar[i] = '='
+    else:
+        for i in range(pos, mid + 1):
+            bar[i] = '='
+    bar[mid] = '|'
+    bar[pos] = '#'
+
+    near = '*' if (pct < 0.05 or pct > 0.95) else ' '
+    return '[' + ''.join(bar) + ']' + near
+
+
+def _ik_err_tag(err_mm: float) -> str:
+    if err_mm < 5.0:
+        return 'OK'
+    if err_mm < 20.0:
+        return '~'
+    return '!'
+
+
 def _accel(cur: float, tgt: float, ac: float, br: float, dt: float) -> float:
     if abs(tgt) > 1e-4:
         diff = tgt - cur
@@ -97,13 +150,14 @@ def _accel(cur: float, tgt: float, ac: float, br: float, dt: float) -> float:
     return math.copysign(max(0.0, abs(cur) - step), cur) if cur != 0.0 else 0.0
 
 
+# ── Controller ──────────────────────────────────────────────────────────
+
 class TeleopController:
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData):
         self.m = model
         self.d = data
         self.ks = KeyState()
 
-        # ── 헬퍼 ────────────────────────────────────────────────────────
         def aid(name):
             i = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
             assert i >= 0, f'actuator not found: {name}'
@@ -127,7 +181,7 @@ class TeleopController:
             assert i >= 0, f'body not found: {name}'
             return i
 
-        # ── Actuator IDs ────────────────────────────────────────────────
+        # Actuator IDs
         self._a_steer = {k: aid(f'{k}_wheel_steer') for k in WHEEL_XY}
         self._a_drive = {k: aid(f'{k}_wheel_drive') for k in WHEEL_XY}
         self._a_lift  = aid('lift_joint')
@@ -136,7 +190,7 @@ class TeleopController:
         self._a_fin_l = {n: try_aid(n) for n in FIN_L}
         self._a_fin_r = {n: try_aid(n) for n in FIN_R}
 
-        # ── Joint 주소 ──────────────────────────────────────────────────
+        # Joint addresses
         fj = jid('floating_base')
         self._fj_qpos = model.jnt_qposadr[fj]
         self._fj_dof  = model.jnt_dofadr[fj]
@@ -168,7 +222,7 @@ class TeleopController:
         self._fin_l_info = fin_info(FIN_L)
         self._fin_r_info = fin_info(FIN_R)
 
-        # ── EE / shoulder body IDs ──────────────────────────────────────
+        # EE / shoulder bodies
         self._ee_l = bid('hx5_l_base')
         self._ee_r = bid('hx5_r_base')
 
@@ -177,7 +231,7 @@ class TeleopController:
         self._shoulder_l_bid = model.body_parentid[jl1_bid]
         self._shoulder_r_bid = model.body_parentid[jr1_bid]
 
-        # ── Can reset ───────────────────────────────────────────────────
+        # Can reset
         can_j = try_jid('can_free')
         if can_j is not None:
             self._can_qadr = model.jnt_qposadr[can_j]
@@ -186,43 +240,43 @@ class TeleopController:
             self._can_qadr = self._can_vadr = None
         self._can_init_qpos: np.ndarray | None = None
 
-        # ── 속도 상태 (물리 베이스용) ───────────────────────────────────
-        self._vx         = 0.0   # 원하는 base 속도 (world-frame)
-        self._vy         = 0.0
-        self._yaw_rate   = 0.0
+        # Base velocity state (smooth inertia model)
+        self._vx = 0.0
+        self._vy = 0.0
+        self._yaw_rate = 0.0
 
-        # ── IK 상태 ─────────────────────────────────────────────────────
+        # IK state
         self._ik_tgt_l_base = np.zeros(3)
         self._ik_tgt_r_base = np.zeros(3)
         self._ik_err_l = 0.0
         self._ik_err_r = 0.0
 
-        # ── FK 상태 ─────────────────────────────────────────────────────
-        self._mode       = 'ik'   # 'ik' | 'fk'
-        self._fk_joint   = 0      # 선택된 joint 인덱스 (0-6)
-        self._fk_arm     = 'l'    # 'l' | 'r'
+        # FK state
+        self._mode     = 'ik'
+        self._fk_joint = 0
+        self._fk_arm   = 'l'
 
-        # ── 그립 ────────────────────────────────────────────────────────
-        self._grip_l  = False
-        self._grip_r  = False
+        # Grip state (0.0-1.0)
+        self._grip_l  = 0.0
+        self._grip_r  = 0.0
         self._tgl_l_t = -99.0
         self._tgl_r_t = -99.0
 
-        # ── 기타 상태 ───────────────────────────────────────────────────
+        # Misc state
         self.show_gizmo  = True
         self._cam_follow = False
         self._fullscreen = False
         self._wall_t0    = time.perf_counter()
         self._freq_ema   = 60.0
 
-        # ── Public attributes (markers.py 등에서 읽음) ─────────────────
+        # Public cache (read by markers.py)
         self.ik_world_tgt_l = np.zeros(3)
         self.ik_world_tgt_r = np.zeros(3)
         self.ee_pos_l       = np.zeros(3)
         self.ee_pos_r       = np.zeros(3)
         self.base_world_pos = np.zeros(3)
 
-    # ── base_yaw (물리 quaternion에서 읽음) ─────────────────────────────
+    # ── base_yaw from physics quaternion ────────────────────────────────
 
     @property
     def base_yaw(self) -> float:
@@ -239,15 +293,14 @@ class TeleopController:
     def reset(self):
         mujoco.mj_resetData(self.m, self.d)
         qa = self._fj_qpos
-        self.d.qpos[qa + 2] = 0.1465   # 바퀴가 바닥에 닿는 높이
-        self.d.qpos[qa + 3] = 1.0      # quaternion w=1 (yaw=0)
+        self.d.qpos[qa + 2] = 0.1465
+        self.d.qpos[qa + 3] = 1.0
         mujoco.mj_forward(self.m, self.d)
 
         self._vx = self._vy = self._yaw_rate = 0.0
-
         self._ik_tgt_l_base = self._world_to_base(self.d.xpos[self._ee_l].copy())
         self._ik_tgt_r_base = self._world_to_base(self.d.xpos[self._ee_r].copy())
-        self._grip_l = self._grip_r = False
+        self._grip_l = self._grip_r = 0.0
         self._mode = 'ik'
 
         if self._can_qadr is not None:
@@ -257,36 +310,36 @@ class TeleopController:
         self._apply_grip('r', 0.0)
         self._wall_t0 = time.perf_counter()
 
-        # 바퀴 정지
         for k in WHEEL_XY:
             self.d.ctrl[self._a_steer[k]] = 0.0
             self.d.ctrl[self._a_drive[k]] = 0.0
 
-    # ── 키 콜백 (GLFW 스레드) ────────────────────────────────────────────
+    # ── Key callback (GLFW thread) ────────────────────────────────────────
 
     def on_key(self, key: int):
         self.ks.on_key(key)
         t = time.perf_counter()
 
-        # 그립 토글
+        # Grip toggle (full open ↔ full close)
         if key == _K['Z'] and (t - self._tgl_l_t) > 0.3:
-            self._grip_l = not self._grip_l; self._tgl_l_t = t
+            self._grip_l  = 0.0 if self._grip_l > 0.5 else 1.0
+            self._tgl_l_t = t
         if key == _K['X'] and (t - self._tgl_r_t) > 0.3:
-            self._grip_r = not self._grip_r; self._tgl_r_t = t
+            self._grip_r  = 0.0 if self._grip_r > 0.5 else 1.0
+            self._tgl_r_t = t
 
-        # 모드 전환
+        # Mode switch
         if key == _K['TAB']:
             if self._mode == 'ik':
                 self._mode = 'fk'
             else:
-                # FK→IK: 현재 EE 위치로 IK 타겟 초기화
                 self._ik_tgt_l_base = self._world_to_base(
                     self.d.xpos[self._ee_l].copy())
                 self._ik_tgt_r_base = self._world_to_base(
                     self.d.xpos[self._ee_r].copy())
                 self._mode = 'ik'
 
-        # FK 조인트 선택
+        # FK joint selection
         if self._mode == 'fk':
             if key == _K['LBRACK']:
                 self._fk_joint = (self._fk_joint - 1) % 7
@@ -297,7 +350,6 @@ class TeleopController:
             if key == _K['2']:
                 self._fk_arm = 'r'
 
-        # 공통
         if key == _K['F']:
             self._cam_follow = not self._cam_follow
         if key == _K['G']:
@@ -307,7 +359,7 @@ class TeleopController:
         if key == _K['F11']:
             self._toggle_fullscreen()
 
-    # ── 메인 업데이트 ────────────────────────────────────────────────────
+    # ── Main update ──────────────────────────────────────────────────────
 
     def update(self, dt: float, run_ik: bool = True):
         freq = 1.0 / dt if dt > 1e-6 else self._freq_ema
@@ -325,45 +377,35 @@ class TeleopController:
 
         self._update_grip()
 
-    # ── 베이스 (물리 바퀴 actuator만 사용) ──────────────────────────────
+    # ── Base (physical wheel actuators only) ─────────────────────────────
 
     def _update_base(self, dt: float):
         ks = self.ks
-        tvx  = (float(ks.is_down(_K['W'])) - float(ks.is_down(_K['S']))) * BASE_MAX_SPD
-        tvy  = (float(ks.is_down(_K['A'])) - float(ks.is_down(_K['D']))) * BASE_MAX_SPD
-        tyaw = (float(ks.is_down(_K['LEFT'])) - float(ks.is_down(_K['RIGHT']))) * YAW_MAX_SPD
+        tvx  = (float(ks.is_down(_K['UP']))    - float(ks.is_down(_K['DOWN'])))  * BASE_MAX_SPD
+        tyaw = (float(ks.is_down(_K['LEFT']))  - float(ks.is_down(_K['RIGHT']))) * YAW_MAX_SPD
 
-        # 관성 모델 (속도 제한)
         self._vx       = _accel(self._vx,       tvx,  K_ACCEL,     K_BRAKE,     dt)
-        self._vy       = _accel(self._vy,        tvy,  K_ACCEL,     K_BRAKE,     dt)
         self._yaw_rate = _accel(self._yaw_rate,  tyaw, K_YAW_ACCEL, K_YAW_BRAKE, dt)
+        self._vy = 0.0  # no lateral movement
 
         yaw = self.base_yaw
         c, s_ = math.cos(yaw), math.sin(yaw)
+        wx = c * self._vx
+        wy = s_ * self._vx
 
-        # body-frame → world-frame 속도
-        wx = c * self._vx - s_ * self._vy
-        wy = s_ * self._vx + c  * self._vy
-
-        # 각 바퀴의 원하는 속도 → steer각 + drive 각속도
         for name, wxy in WHEEL_XY.items():
-            # 바퀴 중심에서의 속도 (world-frame)
             wvx = wx  - self._yaw_rate * wxy[1]
             wvy = wy  + self._yaw_rate * wxy[0]
             spd = math.sqrt(wvx ** 2 + wvy ** 2)
-
-            ang  = math.atan2(wvy, wvx) if spd > 0.01 else 0.0
+            ang = math.atan2(wvy, wvx) if spd > 0.01 else 0.0
             sign = 1.0
             if ang > math.pi / 2:
                 ang -= math.pi; sign = -1.0
             elif ang < -math.pi / 2:
                 ang += math.pi; sign = -1.0
-
-            # steer = 위치 서보 (라디안), drive = 각속도 서보 (rad/s)
             self.d.ctrl[self._a_steer[name]] = ang
             self.d.ctrl[self._a_drive[name]] = sign * spd / WHEEL_RADIUS
 
-        # 공용 속성 업데이트
         qa = self._fj_qpos
         self.base_world_pos = np.array([
             float(self.d.qpos[qa]),
@@ -371,18 +413,18 @@ class TeleopController:
             float(self.d.qpos[qa + 2]),
         ])
 
-    # ── 리프트 (부드러운 연속 이동) ─────────────────────────────────────
+    # ── Lift ─────────────────────────────────────────────────────────────
 
     def _update_lift(self, dt: float):
-        qa      = self._j_lift_qadr
-        lo, hi  = self._j_lift_range
-        ks = self.ks
-        delta = (float(ks.is_down(_K['Q'])) - float(ks.is_down(_K['E']))) * LIFT_STEP
+        qa     = self._j_lift_qadr
+        lo, hi = self._j_lift_range
+        delta  = (float(self.ks.is_down(_K['Q'])) -
+                  float(self.ks.is_down(_K['E']))) * LIFT_STEP
         if delta != 0.0:
             self.d.qpos[qa] = float(np.clip(self.d.qpos[qa] + delta, lo, hi))
         self.d.ctrl[self._a_lift] = self.d.qpos[qa]
 
-    # ── IK 타겟 (base-frame, 연속 속도) ─────────────────────────────────
+    # ── IK target update (base-frame, continuous velocity) ───────────────
 
     def _update_ik_targets(self, dt: float):
         ks   = self.ks
@@ -403,7 +445,7 @@ class TeleopController:
             self._ik_tgt_r_base = self._clamp_ws(self._ik_tgt_r_base,
                                                    self._shoulder_r_bid)
 
-    # ── IK 솔버 ─────────────────────────────────────────────────────────
+    # ── IK solver ────────────────────────────────────────────────────────
 
     def _update_ik(self):
         mujoco.mj_forward(self.m, self.d)
@@ -428,17 +470,16 @@ class TeleopController:
         for aid, qadr in zip(self._a_arm_r, self._jr_qadrs):
             self.d.ctrl[aid] = self.d.qpos[qadr]
 
-    # ── FK 직접 관절 제어 ────────────────────────────────────────────────
+    # ── FK direct joint control ───────────────────────────────────────────
 
     def _update_fk(self, dt: float):
-        # mj_step 이후 xpos가 갱신되므로 항상 EE 캐시 갱신
         self.ee_pos_l = self.d.xpos[self._ee_l].copy()
         self.ee_pos_r = self.d.xpos[self._ee_r].copy()
         self.ik_world_tgt_l = self.ee_pos_l
         self.ik_world_tgt_r = self.ee_pos_r
 
-        ks = self.ks
-        delta = (float(ks.is_down(_K['I'])) - float(ks.is_down(_K['K']))) * FK_SPEED * dt
+        delta = (float(self.ks.is_down(_K['I'])) -
+                 float(self.ks.is_down(_K['K']))) * FK_SPEED * dt
         if abs(delta) < 1e-9:
             return
 
@@ -460,11 +501,11 @@ class TeleopController:
         self.ik_world_tgt_l = self.ee_pos_l
         self.ik_world_tgt_r = self.ee_pos_r
 
-    # ── 파지 ────────────────────────────────────────────────────────────
+    # ── Grip ─────────────────────────────────────────────────────────────
 
     def _update_grip(self):
-        self._apply_grip('l', 1.0 if self._grip_l else 0.0)
-        self._apply_grip('r', 1.0 if self._grip_r else 0.0)
+        self._apply_grip('l', self._grip_l)
+        self._apply_grip('r', self._grip_r)
 
     def _apply_grip(self, side: str, grip: float):
         s    = 1.0 if side == 'l' else -1.0
@@ -501,7 +542,7 @@ class TeleopController:
 
             self.d.ctrl[a_id] = float(np.clip(target, lo, hi))
 
-    # ── 캔 리셋 ─────────────────────────────────────────────────────────
+    # ── Can reset ────────────────────────────────────────────────────────
 
     def _reset_can(self):
         if self._can_qadr is None or self._can_init_qpos is None:
@@ -510,7 +551,7 @@ class TeleopController:
         self.d.qvel[self._can_vadr: self._can_vadr + 6] = 0.0
         mujoco.mj_forward(self.m, self.d)
 
-    # ── 전체화면 (GLFW 스레드에서 호출) ─────────────────────────────────
+    # ── Fullscreen ───────────────────────────────────────────────────────
 
     def _toggle_fullscreen(self):
         if not _HAS_GLFW:
@@ -532,7 +573,7 @@ class TeleopController:
         except Exception:
             pass
 
-    # ── 좌표 변환 ────────────────────────────────────────────────────────
+    # ── Coordinate helpers ────────────────────────────────────────────────
 
     def _rot(self) -> np.ndarray:
         yaw = self.base_yaw
@@ -540,17 +581,17 @@ class TeleopController:
         return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
     def _base_to_world(self, local: np.ndarray) -> np.ndarray:
-        qa  = self._fj_qpos
-        bp  = np.array([float(self.d.qpos[qa]),
-                         float(self.d.qpos[qa + 1]),
-                         float(self.d.qpos[qa + 2])])
+        qa = self._fj_qpos
+        bp = np.array([float(self.d.qpos[qa]),
+                        float(self.d.qpos[qa + 1]),
+                        float(self.d.qpos[qa + 2])])
         return self._rot() @ local + bp
 
     def _world_to_base(self, world: np.ndarray) -> np.ndarray:
-        qa  = self._fj_qpos
-        bp  = np.array([float(self.d.qpos[qa]),
-                         float(self.d.qpos[qa + 1]),
-                         float(self.d.qpos[qa + 2])])
+        qa = self._fj_qpos
+        bp = np.array([float(self.d.qpos[qa]),
+                        float(self.d.qpos[qa + 1]),
+                        float(self.d.qpos[qa + 2])])
         return self._rot().T @ (world - bp)
 
     def _clamp_ws(self, tgt_base: np.ndarray, shoulder_bid: int) -> np.ndarray:
@@ -562,10 +603,9 @@ class TeleopController:
             delta *= IK_WORKSPACE / dist
         return sh_base + delta
 
-    # ── 오버레이 ─────────────────────────────────────────────────────────
+    # ── Overlay entry point ───────────────────────────────────────────────
 
     def overlay(self, viewer):
-        # 카메라 추적
         if self._cam_follow:
             try:
                 qa = self._fj_qpos
@@ -575,7 +615,6 @@ class TeleopController:
             except Exception:
                 pass
 
-        # 3D 마커
         try:
             from .markers import render as _rm
             _rm(viewer.user_scn, self)
@@ -584,126 +623,176 @@ class TeleopController:
 
         self._draw_hud(viewer)
 
+    # ── HUD drawing ──────────────────────────────────────────────────────
+
     def _draw_hud(self, viewer):
-        el  = self._ik_err_l * 1000.0
-        er  = self._ik_err_r * 1000.0
+        topleft   = self._panel_joints()
+        topright  = self._panel_ik_and_telemetry()
+        bottomleft  = self._panel_status()
+        bottomright = self._panel_controls()
 
-        def col(e):
-            return 'G' if e < 5.0 else ('Y' if e < 20.0 else 'R')
-
-        qa    = self._fj_qpos
-        bx    = float(self.d.qpos[qa])
-        by    = float(self.d.qpos[qa + 1])
-        bz    = float(self.d.qpos[qa + 2])
-        lz    = float(self.d.qpos[self._j_lift_qadr])
-        yaw   = self.base_yaw
-        deg   = math.degrees(yaw)
-        vspd  = math.sqrt(self._vx ** 2 + self._vy ** 2)
-        wall  = time.perf_counter() - self._wall_t0
-        simtm = float(self.d.time)
-
-        # ── 조인트 상태 패널 ─────────────────────────────────────────────
-        def joint_bar(val, lo, hi, width=12):
-            """범위 대비 현재값을 ASCII 바로 표시."""
-            if hi <= lo:
-                return '[' + '?' * width + ']'
-            pct = (val - lo) / (hi - lo)
-            pct = max(0.0, min(1.0, pct))
-            filled = int(round(pct * width))
-            bar = '=' * filled + '-' * (width - filled)
-            return f'[{bar}]'
-
-        def arm_row(qadrs, ranges, selected_idx, label):
-            lines = [f'── {label} ──']
-            for i in range(7):
-                val    = math.degrees(float(self.d.qpos[qadrs[i]]))
-                lo, hi = math.degrees(ranges[i][0]), math.degrees(ranges[i][1])
-                bar    = joint_bar(float(self.d.qpos[qadrs[i]]),
-                                   ranges[i][0], ranges[i][1])
-                mark   = '►' if (self._mode == 'fk' and i == selected_idx) else ' '
-                # 한계 경고
-                pct = (float(self.d.qpos[qadrs[i]]) - ranges[i][0]) / (
-                    ranges[i][1] - ranges[i][0] + 1e-10)
-                warn = '!' if (pct < 0.05 or pct > 0.95) else ' '
-                lines.append(
-                    f'{mark}J{i+1} {bar} {val:+7.1f}° [{lo:+.0f}~{hi:+.0f}]{warn}')
-            return '\n'.join(lines)
-
-        fk_arm_idx = self._fk_joint if self._mode == 'fk' else -1
-        fk_arm     = self._fk_arm
-
-        topleft = (
-            arm_row(self._jl_qadrs, self._jl_ranges,
-                    fk_arm_idx if fk_arm == 'l' else -1, 'Left Arm') +
-            '\n\n' +
-            arm_row(self._jr_qadrs, self._jr_ranges,
-                    fk_arm_idx if fk_arm == 'r' else -1, 'Right Arm') +
-            f'\nLift {lz:+.3f} m'
-        )
-
-        # ── 텔레메트리 ───────────────────────────────────────────────────
-        topright = (
-            '─── Telemetry ───\n'
-            f'Sim  {simtm:8.3f} s\n'
-            f'Wall {wall:8.1f} s\n'
-            f'Freq {self._freq_ema:6.1f} Hz\n'
-            '─── IK Error ────\n'
-            f'L {el:6.1f} mm [{col(el)}]\n'
-            f'R {er:6.1f} mm [{col(er)}]'
-        )
-
-        # ── 상태 패널 ────────────────────────────────────────────────────
-        mode_str = (
-            f'[FK] Arm:{self._fk_arm.upper()} J{self._fk_joint+1}  '
-            f'[/] joint select  I/K move'
-            if self._mode == 'fk' else
-            f'[IK] L({self._ik_tgt_l_base[0]:+.2f},{self._ik_tgt_l_base[1]:+.2f},'
-            f'{self._ik_tgt_l_base[2]:+.2f})  '
-            f'R({self._ik_tgt_r_base[0]:+.2f},{self._ik_tgt_r_base[1]:+.2f},'
-            f'{self._ik_tgt_r_base[2]:+.2f})'
-        )
-        bottomleft = (
-            f'Mode: {mode_str}\n'
-            f'Base  pos=({bx:+.2f},{by:+.2f},{bz:+.2f})  '
-            f'yaw={deg:+.1f}°  |v|={vspd:.2f} m/s\n'
-            f'Grip  L={"GRIP" if self._grip_l else "open"}  '
-            f'R={"GRIP" if self._grip_r else "open"}\n'
-            f'Cam={"ON" if self._cam_follow else "off"}  '
-            f'Gizmo={"ON" if self.show_gizmo else "off"}  '
-            f'Fullscr={"ON" if self._fullscreen else "off"}'
-        )
-
-        bottomright = (
-            '── Controls ──────────────\n'
-            'WASD=이동  ←/→=yaw  Q/E=리프트\n'
-            'Tab=FK↔IK 전환\n'
-            'IK: IJKL UO=EE이동  1=좌팔  2=우팔\n'
-            'FK: 1/2=팔선택  [/]=조인트  I/K=각도\n'
-            'Z/X=그립  F=카메라  G=기즈모\n'
-            'R=캔리셋  F11=전체화면'
-        )
-
+        texts = [
+            (mujoco.mjtFontScale.mjFONTSCALE_100,
+             mujoco.mjtGridPos.mjGRID_TOPLEFT,
+             topleft, ''),
+            (mujoco.mjtFontScale.mjFONTSCALE_100,
+             mujoco.mjtGridPos.mjGRID_TOPRIGHT,
+             topright, ''),
+            (mujoco.mjtFontScale.mjFONTSCALE_150,
+             mujoco.mjtGridPos.mjGRID_BOTTOMLEFT,
+             bottomleft, ''),
+            (mujoco.mjtFontScale.mjFONTSCALE_100,
+             mujoco.mjtGridPos.mjGRID_BOTTOMRIGHT,
+             '', bottomright),
+        ]
         try:
-            viewer.set_texts([
-                (mujoco.mjtFontScale.mjFONTSCALE_100,
-                 mujoco.mjtGridPos.mjGRID_TOPLEFT,
-                 topleft, ''),
-                (mujoco.mjtFontScale.mjFONTSCALE_100,
-                 mujoco.mjtGridPos.mjGRID_TOPRIGHT,
-                 topright, ''),
-                (mujoco.mjtFontScale.mjFONTSCALE_150,
-                 mujoco.mjtGridPos.mjGRID_BOTTOMLEFT,
-                 bottomleft, ''),
-                (mujoco.mjtFontScale.mjFONTSCALE_100,
-                 mujoco.mjtGridPos.mjGRID_BOTTOMRIGHT,
-                 '', bottomright),
-            ])
+            viewer.set_texts(texts)
         except Exception:
             try:
-                viewer.set_texts([(
-                    mujoco.mjtFontScale.mjFONTSCALE_150,
-                    mujoco.mjtGridPos.mjGRID_BOTTOMLEFT,
-                    bottomleft, bottomright,
-                )])
+                viewer.set_texts([texts[2]])
             except Exception:
                 pass
+
+    # ── Panel: joint angles ───────────────────────────────────────────────
+
+    def _panel_joints(self) -> str:
+        PW = 14  # bar width
+
+        def arm_block(label, qadrs, ranges, sel_j, active):
+            lines = [f'--- {label} ---']
+            for i in range(7):
+                val     = float(self.d.qpos[qadrs[i]])
+                lo, hi  = ranges[i]
+                deg     = math.degrees(val)
+                lo_d    = math.degrees(lo)
+                hi_d    = math.degrees(hi)
+                bar     = _pbar(val, lo, hi, PW)
+                sel     = '>' if (active and i == sel_j) else ' '
+                limit   = '!' if (bar.endswith('*')) else ' '
+                lines.append(
+                    f'{sel}J{i+1} {bar} {deg:+7.1f}  [{lo_d:+.0f}~{hi_d:+.0f}]{limit}')
+            return '\n'.join(lines)
+
+        fk_j   = self._fk_joint if self._mode == 'fk' else -1
+        fk_arm = self._fk_arm   if self._mode == 'fk' else ''
+
+        lz    = float(self.d.qpos[self._j_lift_qadr])
+        lo, hi = self._j_lift_range
+        lift_bar = _pbar(lz, lo, hi, PW)
+
+        return (
+            arm_block('Left Arm',  self._jl_qadrs, self._jl_ranges,
+                      fk_j, fk_arm == 'l') +
+            '\n\n' +
+            arm_block('Right Arm', self._jr_qadrs, self._jr_ranges,
+                      fk_j, fk_arm == 'r') +
+            f'\n\n--- Lift ---\n {lift_bar} {lz*1000:+.0f}mm'
+        )
+
+    # ── Panel: IK targets + telemetry + hand ─────────────────────────────
+
+    def _panel_ik_and_telemetry(self) -> str:
+        PW = 16
+        tl  = self._ik_tgt_l_base
+        tr  = self._ik_tgt_r_base
+        el  = self._ik_err_l * 1000.0
+        er  = self._ik_err_r * 1000.0
+        tag_l = _ik_err_tag(el)
+        tag_r = _ik_err_tag(er)
+
+        sim_t  = float(self.d.time)
+        wall_t = time.perf_counter() - self._wall_t0
+        freq   = self._freq_ema
+
+        mode_str = self._mode.upper()
+        arm_str  = ('BOTH' if self._mode == 'ik' else
+                    ('L' if self._fk_arm == 'l' else 'R'))
+
+        # IK target bars - show L/R on consecutive lines per axis
+        def ik_rows():
+            axes   = [('X(fwd)', tl[0], tr[0], *IK_X_RANGE),
+                      ('Y(lat)', tl[1], tr[1], *IK_Y_RANGE),
+                      ('Z( up)', tl[2], tr[2], *IK_Z_RANGE)]
+            rows = []
+            for name, lv, rv, lo, hi in axes:
+                lb = _pbar(lv, lo, hi, PW)
+                rb = _pbar(rv, lo, hi, PW)
+                rows.append(f' L {name} {lb} {lv:+.3f}m')
+                rows.append(f' R {name} {rb} {rv:+.3f}m')
+                rows.append('')
+            return '\n'.join(rows)
+
+        # Wrist (joints 5,6,7) as compact bars
+        def wrist_row(label, qadrs, ranges):
+            parts = []
+            for i in range(4, 7):
+                v      = float(self.d.qpos[qadrs[i]])
+                lo, hi = ranges[i]
+                bar    = _pbar(v, lo, hi, 8)
+                deg    = math.degrees(v)
+                parts.append(f'J{i+1}{bar}{deg:+.0f}')
+            return f' {label}: ' + '  '.join(parts)
+
+        # Grip bars
+        gl_pct = int(self._grip_l * 100)
+        gr_pct = int(self._grip_r * 100)
+        # 0% grip is the normal open state; suppress near-limit warning
+        gl_bar = _pbar(self._grip_l, -0.01, 1.0, 12)[:-1] + ' '
+        gr_bar = _pbar(self._grip_r, -0.01, 1.0, 12)[:-1] + ' '
+        gl_str = 'GRIP' if self._grip_l > 0.5 else 'open'
+        gr_str = 'GRIP' if self._grip_r > 0.5 else 'open'
+
+        return '\n'.join([
+            '--- Telemetry ---',
+            f' Sim  {sim_t:8.3f}s   Wall {wall_t:7.1f}s',
+            f' Freq {freq:7.1f} Hz',
+            f' IK-L {el:6.1f}mm [{tag_l}]   IK-R {er:6.1f}mm [{tag_r}]',
+            '',
+            f'--- IK Targets  Mode:{mode_str} Arm:{arm_str} ---',
+            ik_rows(),
+            '--- Wrist (J5/6/7) ---',
+            wrist_row('L', self._jl_qadrs, self._jl_ranges),
+            wrist_row('R', self._jr_qadrs, self._jr_ranges),
+            '',
+            '--- Hand ---',
+            f' L ({gl_str}) Z={gl_bar} {gl_pct:3d}%',
+            f' R ({gr_str}) X={gr_bar} {gr_pct:3d}%',
+        ])
+
+    # ── Panel: status ─────────────────────────────────────────────────────
+
+    def _panel_status(self) -> str:
+        qa  = self._fj_qpos
+        bx  = float(self.d.qpos[qa])
+        by  = float(self.d.qpos[qa + 1])
+        deg = math.degrees(self.base_yaw)
+        spd = abs(self._vx)
+
+        mode_disp = self._mode.upper()
+        if self._mode == 'fk':
+            mode_disp += f'  arm:{self._fk_arm.upper()}  J{self._fk_joint+1}'
+
+        cam_s = 'ON' if self._cam_follow  else 'off'
+        giz_s = 'ON' if self.show_gizmo  else 'off'
+        fs_s  = 'ON' if self._fullscreen else 'off'
+
+        return '\n'.join([
+            f'Mode:{mode_disp}   Cam:{cam_s} Gizmo:{giz_s} FS:{fs_s}',
+            f'Base ({bx:+.2f},{by:+.2f}) yaw={deg:+.1f}  spd={spd:.2f}m/s',
+        ])
+
+    # ── Panel: controls ───────────────────────────────────────────────────
+
+    def _panel_controls(self) -> str:
+        return '\n'.join([
+            '--- Controls ---',
+            'UP/DN=fwd/bk   LT/RT=yaw',
+            'Q/E=lift up/dn',
+            'Tab=FK/IK mode',
+            'IK: I/K J/L U/O = EE move',
+            '    1=L-only  2=R-only',
+            'FK: 1/2=arm  [/]=joint',
+            '    I/K=adjust angle',
+            'Z/X=grip  F=cam  G=gizmo',
+            'R=reset can   F11=fullscreen',
+        ])
