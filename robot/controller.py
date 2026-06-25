@@ -55,6 +55,9 @@ _K.update({
     'TAB':    258,
     'LBRACK': 91,    # [
     'RBRACK': 93,    # ]
+    'HOME':   268,   # FK: joint → max
+    'END':    269,   # FK: joint → min
+    'DEL':    261,   # FK: joint → 0
 })
 
 # ── Physical constants ──────────────────────────────────────────────────
@@ -240,10 +243,13 @@ class TeleopController:
             self._can_qadr = self._can_vadr = None
         self._can_init_qpos: np.ndarray | None = None
 
-        # Base velocity state (smooth inertia model)
-        self._vx = 0.0
-        self._vy = 0.0
+        # Base velocity / pose state (kinematic model)
+        self._vx       = 0.0
+        self._vy       = 0.0
         self._yaw_rate = 0.0
+        self._yaw_des  = 0.0     # integrated desired yaw angle
+        self._base_z   = 0.1465  # fixed floor height (no gravity sinking)
+        self._win      = None    # GLFW window handle (cached from key callback)
 
         # IK state
         self._ik_tgt_l_base = np.zeros(3)
@@ -276,17 +282,11 @@ class TeleopController:
         self.ee_pos_r       = np.zeros(3)
         self.base_world_pos = np.zeros(3)
 
-    # ── base_yaw from physics quaternion ────────────────────────────────
+    # ── base_yaw — uses integrated kinematic state ───────────────────────
 
     @property
     def base_yaw(self) -> float:
-        qa = self._fj_qpos
-        qw = float(self.d.qpos[qa + 3])
-        qx = float(self.d.qpos[qa + 4])
-        qy = float(self.d.qpos[qa + 5])
-        qz = float(self.d.qpos[qa + 6])
-        return math.atan2(2.0 * (qw * qz + qx * qy),
-                          1.0 - 2.0 * (qy * qy + qz * qz))
+        return self._yaw_des
 
     # ── Reset ────────────────────────────────────────────────────────────
 
@@ -298,6 +298,8 @@ class TeleopController:
         mujoco.mj_forward(self.m, self.d)
 
         self._vx = self._vy = self._yaw_rate = 0.0
+        self._yaw_des = 0.0
+        self._base_z  = float(self.d.qpos[qa + 2])
         self._ik_tgt_l_base = self._world_to_base(self.d.xpos[self._ee_l].copy())
         self._ik_tgt_r_base = self._world_to_base(self.d.xpos[self._ee_r].copy())
         self._grip_l = self._grip_r = 0.0
@@ -317,6 +319,16 @@ class TeleopController:
     # ── Key callback (GLFW thread) ────────────────────────────────────────
 
     def on_key(self, key: int):
+        # Cache GLFW window handle the first time we're called (we're in the
+        # GLFW thread here so get_current_context() is reliable).
+        if _HAS_GLFW and self._win is None:
+            try:
+                w = _glfw.get_current_context()
+                if w and w != 0:
+                    self._win = w
+            except Exception:
+                pass
+
         self.ks.on_key(key)
         t = time.perf_counter()
 
@@ -339,7 +351,7 @@ class TeleopController:
                     self.d.xpos[self._ee_r].copy())
                 self._mode = 'ik'
 
-        # FK joint selection
+        # FK joint selection + quick-set
         if self._mode == 'fk':
             if key == _K['LBRACK']:
                 self._fk_joint = (self._fk_joint - 1) % 7
@@ -349,6 +361,9 @@ class TeleopController:
                 self._fk_arm = 'l'
             if key == _K['2']:
                 self._fk_arm = 'r'
+            # Home/End/Del: jump selected joint to limit or zero
+            if key in (_K['HOME'], _K['END'], _K['DEL']):
+                self._fk_jump(key)
 
         if key == _K['F']:
             self._cam_follow = not self._cam_follow
@@ -377,22 +392,45 @@ class TeleopController:
 
         self._update_grip()
 
-    # ── Base (physical wheel actuators only) ─────────────────────────────
+    # ── Base (kinematic pose + visual wheel animation) ────────────────────
 
     def _update_base(self, dt: float):
         ks = self.ks
-        tvx  = (float(ks.is_down(_K['UP']))    - float(ks.is_down(_K['DOWN'])))  * BASE_MAX_SPD
-        tyaw = (float(ks.is_down(_K['LEFT']))  - float(ks.is_down(_K['RIGHT']))) * YAW_MAX_SPD
+        tvx  = (float(ks.is_down(_K['UP']))   - float(ks.is_down(_K['DOWN'])))  * BASE_MAX_SPD
+        tyaw = (float(ks.is_down(_K['LEFT'])) - float(ks.is_down(_K['RIGHT']))) * YAW_MAX_SPD
 
         self._vx       = _accel(self._vx,       tvx,  K_ACCEL,     K_BRAKE,     dt)
-        self._yaw_rate = _accel(self._yaw_rate,  tyaw, K_YAW_ACCEL, K_YAW_BRAKE, dt)
-        self._vy = 0.0  # no lateral movement
+        self._yaw_rate = _accel(self._yaw_rate, tyaw,  K_YAW_ACCEL, K_YAW_BRAKE, dt)
 
-        yaw = self.base_yaw
-        c, s_ = math.cos(yaw), math.sin(yaw)
+        # Integrate desired yaw
+        self._yaw_des += self._yaw_rate * dt
+
+        c, s_ = math.cos(self._yaw_des), math.sin(self._yaw_des)
         wx = c * self._vx
         wy = s_ * self._vx
 
+        # KINEMATIC: directly set base qpos — prevents gravity sinking
+        qa = self._fj_qpos
+        self.d.qpos[qa + 0] += wx * dt
+        self.d.qpos[qa + 1] += wy * dt
+        self.d.qpos[qa + 2]  = self._base_z   # locked height
+
+        hw = self._yaw_des * 0.5
+        self.d.qpos[qa + 3] = math.cos(hw)
+        self.d.qpos[qa + 4] = 0.0
+        self.d.qpos[qa + 5] = 0.0
+        self.d.qpos[qa + 6] = math.sin(hw)
+
+        # Set qvel so Jacobian-based IK sees correct base velocity
+        da = self._fj_dof
+        self.d.qvel[da + 0] = wx
+        self.d.qvel[da + 1] = wy
+        self.d.qvel[da + 2] = 0.0
+        self.d.qvel[da + 3] = 0.0
+        self.d.qvel[da + 4] = 0.0
+        self.d.qvel[da + 5] = self._yaw_rate
+
+        # Visual wheel animation (steer + drive actuators)
         for name, wxy in WHEEL_XY.items():
             wvx = wx  - self._yaw_rate * wxy[1]
             wvy = wy  + self._yaw_rate * wxy[0]
@@ -406,12 +444,9 @@ class TeleopController:
             self.d.ctrl[self._a_steer[name]] = ang
             self.d.ctrl[self._a_drive[name]] = sign * spd / WHEEL_RADIUS
 
-        qa = self._fj_qpos
-        self.base_world_pos = np.array([
-            float(self.d.qpos[qa]),
-            float(self.d.qpos[qa + 1]),
-            float(self.d.qpos[qa + 2]),
-        ])
+        self.base_world_pos = np.array([float(self.d.qpos[qa]),
+                                        float(self.d.qpos[qa + 1]),
+                                        float(self.d.qpos[qa + 2])])
 
     # ── Lift ─────────────────────────────────────────────────────────────
 
@@ -469,6 +504,26 @@ class TeleopController:
             self.d.ctrl[aid] = self.d.qpos[qadr]
         for aid, qadr in zip(self._a_arm_r, self._jr_qadrs):
             self.d.ctrl[aid] = self.d.qpos[qadr]
+
+    # ── FK quick-set (Home/End/Del) ───────────────────────────────────────
+
+    def _fk_jump(self, key: int):
+        """Jump selected joint to max (Home), min (End), or zero (Del)."""
+        arm    = self._fk_arm
+        qadrs  = self._jl_qadrs if arm == 'l' else self._jr_qadrs
+        aids   = self._a_arm_l  if arm == 'l' else self._a_arm_r
+        ranges = self._jl_ranges if arm == 'l' else self._jr_ranges
+        j      = self._fk_joint
+        lo, hi = ranges[j]
+        if key == _K['HOME']:
+            val = hi
+        elif key == _K['END']:
+            val = lo
+        else:  # DEL
+            val = float(np.clip(0.0, lo, hi))
+        self.d.qpos[qadrs[j]] = val
+        self.d.ctrl[aids[j]]  = val
+        mujoco.mj_forward(self.m, self.d)
 
     # ── FK direct joint control ───────────────────────────────────────────
 
@@ -551,27 +606,27 @@ class TeleopController:
         self.d.qvel[self._can_vadr: self._can_vadr + 6] = 0.0
         mujoco.mj_forward(self.m, self.d)
 
-    # ── Fullscreen ───────────────────────────────────────────────────────
+    # ── Fullscreen / window resize ───────────────────────────────────────
 
     def _toggle_fullscreen(self):
-        if not _HAS_GLFW:
+        """F11: toggle fullscreen using the cached GLFW window handle."""
+        if not _HAS_GLFW or self._win is None:
             return
         try:
-            win = _glfw.get_current_context()
-            if win is None:
-                return
             if not self._fullscreen:
                 mon  = _glfw.get_primary_monitor()
                 mode = _glfw.get_video_mode(mon)
                 _glfw.set_window_monitor(
-                    win, mon, 0, 0,
+                    self._win, mon, 0, 0,
                     mode.size.width, mode.size.height, mode.refresh_rate)
                 self._fullscreen = True
             else:
-                _glfw.set_window_monitor(win, None, 80, 80, 1280, 720, 0)
+                # Restore to a windowed size; position at top-left with margin
+                _glfw.set_window_monitor(
+                    self._win, None, 80, 80, 1280, 720, 0)
                 self._fullscreen = False
-        except Exception:
-            pass
+        except Exception as e:
+            print(f'[ctrl] fullscreen error: {e}')
 
     # ── Coordinate helpers ────────────────────────────────────────────────
 
@@ -767,32 +822,52 @@ class TeleopController:
         by  = float(self.d.qpos[qa + 1])
         deg = math.degrees(self.base_yaw)
         spd = abs(self._vx)
+        yr  = math.degrees(self._yaw_rate)
 
         mode_disp = self._mode.upper()
         if self._mode == 'fk':
-            mode_disp += f'  arm:{self._fk_arm.upper()}  J{self._fk_joint+1}'
+            j      = self._fk_joint
+            qadrs  = self._jl_qadrs if self._fk_arm == 'l' else self._jr_qadrs
+            ranges = self._jl_ranges if self._fk_arm == 'l' else self._jr_ranges
+            cur_deg = math.degrees(float(self.d.qpos[qadrs[j]]))
+            lo_deg  = math.degrees(ranges[j][0])
+            hi_deg  = math.degrees(ranges[j][1])
+            mode_disp += (f'  [{self._fk_arm.upper()}] J{j+1}'
+                          f'  {cur_deg:+.1f}deg  [{lo_deg:+.0f}~{hi_deg:+.0f}]')
 
-        cam_s = 'ON' if self._cam_follow  else 'off'
+        cam_s = 'ON' if self._cam_follow else 'off'
         giz_s = 'ON' if self.show_gizmo  else 'off'
-        fs_s  = 'ON' if self._fullscreen else 'off'
+        fs_s  = 'ON' if self._fullscreen  else 'off'
+
+        win_hint = ('F11=exit-FS' if self._fullscreen
+                    else 'drag-edge=resize  drag-title=move  F11=fullscreen')
 
         return '\n'.join([
-            f'Mode:{mode_disp}   Cam:{cam_s} Gizmo:{giz_s} FS:{fs_s}',
-            f'Base ({bx:+.2f},{by:+.2f}) yaw={deg:+.1f}  spd={spd:.2f}m/s',
+            f'Mode:{mode_disp}',
+            f'Base ({bx:+.2f},{by:+.2f}) yaw={deg:+.1f}  spd={spd:.2f}m/s  rot={yr:+.1f}deg/s',
+            f'Cam:{cam_s} Gizmo:{giz_s} FS:{fs_s}   {win_hint}',
         ])
 
     # ── Panel: controls ───────────────────────────────────────────────────
 
     def _panel_controls(self) -> str:
+        fk_sel = (f'[{self._fk_arm.upper()}] J{self._fk_joint+1}'
+                  if self._mode == 'fk' else '---')
         return '\n'.join([
             '--- Controls ---',
             'UP/DN=fwd/bk   LT/RT=yaw',
             'Q/E=lift up/dn',
             'Tab=FK/IK mode',
-            'IK: I/K J/L U/O = EE move',
-            '    1=L-only  2=R-only',
-            'FK: 1/2=arm  [/]=joint',
-            '    I/K=adjust angle',
-            'Z/X=grip  F=cam  G=gizmo',
-            'R=reset can   F11=fullscreen',
+            '',
+            '[ IK mode ]',
+            ' I/K J/L U/O = EE fwd/bk lat up/dn',
+            ' hold 1=L-only  hold 2=R-only',
+            '',
+            '[ FK mode ]  sel:' + fk_sel,
+            ' 1/2=arm  [/]=joint  I/K=angle',
+            ' Home=max  End=min  Del=zero',
+            '',
+            'Z/X=grip toggle',
+            'F=cam-follow  G=gizmo  R=reset-can',
+            'F11=fullscreen',
         ])

@@ -42,6 +42,7 @@ ASSET_BASE = os.path.join(SCRIPT_DIR, 'assets', 'ffw_sh5', 'robotis_ffw')
 ORIG_SCENE = os.path.join(ASSET_BASE, 'scene_ffw_sh5.xml')
 
 from robot.controller import TeleopController
+from robot.gui import ControlPanel
 
 # ── 렌더 / 물리 비율 설정 ──────────────────────────────────────────────
 # physics timestep 은 model.opt.timestep (보통 0.002s = 500 Hz)
@@ -100,6 +101,7 @@ def main():
     data  = mujoco.MjData(model)
 
     ctrl = TeleopController(model, data)
+    gui  = ControlPanel(ctrl)   # launches Dear PyGui in a daemon thread
 
     with mujoco.viewer.launch_passive(
         model, data,
