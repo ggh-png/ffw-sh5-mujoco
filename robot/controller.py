@@ -88,45 +88,16 @@ ARM_R = [f'arm_r_joint{i}' for i in range(1, 8)]
 FIN_L = [f'finger_l_joint{i}' for i in range(1, 21)]
 FIN_R = [f'finger_r_joint{i}' for i in range(1, 21)]
 
-# grip=0 → all joints at 0 (fingers fully extended / hand open)
-# grip=1 → joints curl to GRIP_CLOSE angles
-#
-# Joint layout (each hand has 20 joints):
-#   1        : thumb  base spread   [-90°, 90°]
-#   2        : thumb  MCP rotation  [0°, 180°]  ← keep fixed (0)
-#   3        : thumb  roll          [-90°,  0°]  ← close = -90° (L), +90° (R)
-#   4        : thumb  curl          [-90°,  0°]  ← close = -90° (L), +90° (R)
-#   5,9,13,17: finger abduction     [-35°, 35°]  ← keep at 0 (no spread)
-#   6,10,14,18: MCP flex            [0°, 115°]   ← close = ~100°
-#   7,11,15,19: PIP flex            [0°,  90°]   ← close = 90°
-#   8,12,16,20: DIP flex            [0°,  90°]   ← close = 90°
-GRIP_CLOSE: dict[str, float] = {}
-
+# Open-hand neutral angles (same as original implementation)
+OPEN_ANGLE: dict[str, float] = {}
 for _jn in FIN_L:
     _ix = int(_jn.split('joint')[1])
-    if _ix == 1:    GRIP_CLOSE[_jn] = 0.0                # thumb spread: neutral
-    elif _ix == 2:  GRIP_CLOSE[_jn] = 0.0                # thumb MCP rot: fixed
-    elif _ix == 3:  GRIP_CLOSE[_jn] = -math.pi / 2       # thumb roll close
-    elif _ix == 4:  GRIP_CLOSE[_jn] = -math.pi / 2       # thumb curl close
-    else:
-        _phase = (_ix - 5) % 4
-        if   _phase == 0: GRIP_CLOSE[_jn] = 0.0           # abduction: no change
-        elif _phase == 1: GRIP_CLOSE[_jn] = 1.7           # MCP ~97° (within 115°)
-        elif _phase == 2: GRIP_CLOSE[_jn] = math.pi / 2   # PIP 90°
-        else:             GRIP_CLOSE[_jn] = math.pi / 2   # DIP 90°
-
+    OPEN_ANGLE[_jn] = (math.pi / 2 if _ix == 2 else
+                       math.pi / 2 if _ix in (6, 10, 14, 18) else 0.0)
 for _jn in FIN_R:
     _ix = int(_jn.split('joint')[1])
-    if _ix == 1:    GRIP_CLOSE[_jn] = 0.0
-    elif _ix == 2:  GRIP_CLOSE[_jn] = 0.0
-    elif _ix == 3:  GRIP_CLOSE[_jn] = math.pi / 2        # mirrored thumb roll
-    elif _ix == 4:  GRIP_CLOSE[_jn] = math.pi / 2        # mirrored thumb curl
-    else:
-        _phase = (_ix - 5) % 4
-        if   _phase == 0: GRIP_CLOSE[_jn] = 0.0
-        elif _phase == 1: GRIP_CLOSE[_jn] = 1.7
-        elif _phase == 2: GRIP_CLOSE[_jn] = math.pi / 2
-        else:             GRIP_CLOSE[_jn] = math.pi / 2
+    OPEN_ANGLE[_jn] = (-math.pi / 2 if _ix == 2 else
+                        math.pi / 2 if _ix in (6, 10, 14, 18) else 0.0)
 
 
 # ── ASCII progress bar helpers ──────────────────────────────────────────
@@ -595,7 +566,8 @@ class TeleopController:
         self._apply_grip('r', self._grip_r)
 
     def _apply_grip(self, side: str, grip: float):
-        """Apply grip ∈ [0,1] (0=fully open, 1=fully closed)."""
+        """Apply grip ∈ [0,1] using the original motion profile."""
+        s    = 1.0 if side == 'l' else -1.0
         info = self._fin_l_info if side == 'l' else self._fin_r_info
         act  = self._a_fin_l    if side == 'l' else self._a_fin_r
 
@@ -603,9 +575,27 @@ class TeleopController:
             a_id = act.get(jname)
             if a_id is None:
                 continue
-            close_val = GRIP_CLOSE.get(jname, 0.0)
-            target = float(np.clip(close_val * grip, lo, hi))
-            self.d.ctrl[a_id] = target
+            idx      = int(jname.split('joint')[1])
+            open_val = OPEN_ANGLE.get(jname, 0.0)
+
+            if idx <= 4:
+                if idx == 2:
+                    target = open_val
+                elif idx in (3, 4):
+                    close  = s * (-math.pi / 3)
+                    target = open_val + (close - open_val) * grip
+                else:
+                    target = open_val
+            else:
+                phase = (idx - 5) % 4
+                if phase == 0:
+                    target = open_val - grip * 0.15
+                elif phase == 1:
+                    target = open_val + grip * (math.pi / 4)
+                else:
+                    target = open_val + grip * (math.pi / 3)
+
+            self.d.ctrl[a_id] = float(np.clip(target, lo, hi))
 
     # ── Can reset ────────────────────────────────────────────────────────
 
