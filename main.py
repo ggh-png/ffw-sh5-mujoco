@@ -6,17 +6,26 @@ Run:  cd /home/ggh/ffw-sh5-mujoco && bash run.sh
 
 Controls
 --------
-WASD         base translate (body-frame)
-←/→          base yaw
-Q/E          lift up/down
-I/K J/L U/O  IK EE move (fwd/bk, lateral, up/dn)
-hold 1       IK left arm only
-hold 2       IK right arm only
-Z/X          left/right grip toggle
-F            camera-follow toggle
-G            gizmo toggle
-R            reset can to initial pose
-F11          fullscreen toggle
+WASD            베이스 이동 (로봇 기준계)
+←/→             베이스 yaw 회전
+Q/E             리프트 상승/하강
+Tab             FK ↔ IK 모드 전환
+
+IK 모드
+  I/K J/L U/O  EE 이동 (전후, 좌우, 상하)
+  hold 1        왼팔만
+  hold 2        오른팔만
+
+FK 모드
+  1/2           왼팔 / 오른팔 선택
+  [/]           조인트 선택 (J1 ↔ J7)
+  I/K           선택 조인트 증가/감소
+
+Z/X             좌/우 그립 토글
+F               카메라 추적 토글
+G               기즈모 토글
+R               캔 초기 위치로 리셋
+F11             전체화면 토글
 """
 import os
 import sys
@@ -34,42 +43,48 @@ ORIG_SCENE = os.path.join(ASSET_BASE, 'scene_ffw_sh5.xml')
 
 from robot.controller import TeleopController
 
+# ── 렌더 / 물리 비율 설정 ──────────────────────────────────────────────
+# physics timestep 은 model.opt.timestep (보통 0.002s = 500 Hz)
+# 렌더는 ~60 Hz → 1프레임당 약 8 물리 스텝
+RENDER_HZ  = 60
+N_SUBSTEPS = 8   # 물리 스텝 수 per 렌더 프레임 (= 500/60 ≈ 8)
+
 
 def build_scene() -> mujoco.MjModel:
-    """원본 FFW-SH5 scene에 table + can을 추가하여 MjModel 반환."""
+    """FFW-SH5 scene에 table + can을 동적으로 추가."""
     spec = mujoco.MjSpec.from_file(ORIG_SCENE)
     wb   = spec.worldbody
 
-    # ── 테이블 (static) ────────────────────────────────────────────────
-    table      = wb.add_body()
+    # 테이블 (static)
+    table = wb.add_body()
     table.name = 'table'
     table.pos  = [0.8, 0, 0]
 
-    top       = table.add_geom()
-    top.name  = 'table_top'
-    top.type  = mujoco.mjtGeom.mjGEOM_BOX
-    top.size  = [0.30, 0.35, 0.02]
-    top.pos   = [0, 0, 0.42]
-    top.rgba  = [0.60, 0.40, 0.20, 1]
+    top = table.add_geom()
+    top.name = 'table_top'
+    top.type = mujoco.mjtGeom.mjGEOM_BOX
+    top.size = [0.30, 0.35, 0.02]
+    top.pos  = [0, 0, 0.42]
+    top.rgba = [0.60, 0.40, 0.20, 1]
 
-    for i, (lx, ly) in enumerate([(-0.27, -0.32), (-0.27, 0.32),
-                                    ( 0.27, -0.32), ( 0.27, 0.32)]):
-        leg      = table.add_geom()
+    for i, (lx, ly) in enumerate([(-0.27, -0.32), (-0.27,  0.32),
+                                    ( 0.27, -0.32), ( 0.27,  0.32)]):
+        leg = table.add_geom()
         leg.name = f'table_leg{i+1}'
         leg.type = mujoco.mjtGeom.mjGEOM_BOX
         leg.size = [0.02, 0.02, 0.21]
         leg.pos  = [lx, ly, 0.21]
         leg.rgba = [0.50, 0.30, 0.15, 1]
 
-    # ── 캔 (dynamic, freejoint) ────────────────────────────────────────
-    can      = wb.add_body()
+    # 캔 (dynamic, freejoint)
+    can = wb.add_body()
     can.name = 'can'
     can.pos  = [0.80, 0, 0.50]
 
-    fj      = can.add_freejoint()
+    fj = can.add_freejoint()
     fj.name = 'can_free'
 
-    cg          = can.add_geom()
+    cg = can.add_geom()
     cg.name     = 'can_geom'
     cg.type     = mujoco.mjtGeom.mjGEOM_CYLINDER
     cg.size     = [0.033, 0.055, 0]
@@ -94,20 +109,30 @@ def main():
     ) as viewer:
         ctrl.reset()
 
-        prev_t = time.perf_counter()
+        frame_dt = 1.0 / RENDER_HZ
+        prev_t   = time.perf_counter()
+
         while viewer.is_running():
-            now = time.perf_counter()
-            dt  = min(now - prev_t, 0.05)
-            prev_t = now
+            t0  = time.perf_counter()
+            dt  = min(t0 - prev_t, 0.05)
+            prev_t = t0
 
-            ctrl.update(dt)
-            mujoco.mj_step(model, data)
+            # ── 물리 서브스텝 ─────────────────────────────────────────
+            # IK 는 마지막 스텝에만 실행 (비용 절감)
+            sub_dt = model.opt.timestep
+            for step in range(N_SUBSTEPS):
+                run_ik = (step == N_SUBSTEPS - 1)
+                ctrl.update(sub_dt, run_ik=run_ik)
+                mujoco.mj_step(model, data)
 
+            # ── 렌더 ─────────────────────────────────────────────────
             ctrl.overlay(viewer)
             viewer.sync()
 
-            sleep_t = model.opt.timestep - (time.perf_counter() - now)
-            if sleep_t > 0:
+            # ── 프레임 타이밍 ─────────────────────────────────────────
+            elapsed = time.perf_counter() - t0
+            sleep_t = frame_dt - elapsed
+            if sleep_t > 0.001:
                 time.sleep(sleep_t)
 
 
