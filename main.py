@@ -128,6 +128,7 @@ def main():
                 run_ik = (step == N_SUBSTEPS - 1)
                 ctrl.update(sub_dt, run_ik=run_ik)
                 mujoco.mj_step(model, data)
+                ctrl.apply_floor_constraint()
 
             # ── 렌더 ─────────────────────────────────────────────────
             ctrl.overlay(viewer)

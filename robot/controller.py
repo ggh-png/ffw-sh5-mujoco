@@ -72,6 +72,12 @@ K_YAW_BRAKE   = 8.0
 IK_WORKSPACE  = 0.78   # m from shoulder
 EMA_ALPHA     = 0.05
 
+# Drive actuator gain: XML default kv=1 is too weak for 100 kg robot.
+# kv=50 puts wheel torque above friction limit so base follows commanded ramp.
+DRIVE_KV = 50.0
+# Wheel-ground contact height when robot rests (robot settles to ~0.003 m).
+BASE_FLOOR_Z = 0.003
+
 # IK target display ranges (base-frame, meters)
 IK_X_RANGE = (-0.50, 1.50)
 IK_Y_RANGE = (-1.00, 1.00)
@@ -186,6 +192,20 @@ class TeleopController:
         # Actuator IDs
         self._a_steer = {k: aid(f'{k}_wheel_steer') for k in WHEEL_XY}
         self._a_drive = {k: aid(f'{k}_wheel_drive') for k in WHEEL_XY}
+
+        # Boost drive velocity-servo gain (kv=1 in XML → DRIVE_KV)
+        for k in WHEEL_XY:
+            a = self._a_drive[k]
+            model.actuator_gainprm[a, 0] = DRIVE_KV
+            model.actuator_biasprm[a, 2] = -DRIVE_KV
+
+        # Cache steer joint qpos/dof addresses for kinematic steer override
+        self._steer_qadr: dict[str, int] = {}
+        self._steer_dof:  dict[str, int] = {}
+        for k in WHEEL_XY:
+            _sjid = int(model.actuator_trnid[self._a_steer[k], 0])
+            self._steer_qadr[k] = model.jnt_qposadr[_sjid]
+            self._steer_dof[k]  = model.jnt_dofadr[_sjid]
         self._a_lift  = aid('lift_joint')
         self._a_arm_l = [aid(n) for n in ARM_L]
         self._a_arm_r = [aid(n) for n in ARM_R]
@@ -242,13 +262,12 @@ class TeleopController:
             self._can_qadr = self._can_vadr = None
         self._can_init_qpos: np.ndarray | None = None
 
-        # Base velocity / pose state (kinematic model)
+        # Base velocity / pose state
         self._vx       = 0.0
-        self._vy       = 0.0
         self._yaw_rate = 0.0
-        self._yaw_des  = 0.0     # integrated desired yaw angle
-        self._base_z   = 0.1465  # fixed floor height (no gravity sinking)
-        self._win      = None    # GLFW window handle (cached from key callback)
+        self._yaw_des  = 0.0     # kinematically integrated yaw angle
+        self._base_z   = BASE_FLOOR_Z  # locked contact height, applied after each mj_step
+        self._win      = None          # GLFW window handle (cached from key callback)
 
         # IK state
         self._ik_tgt_l_base = np.zeros(3)
@@ -279,7 +298,7 @@ class TeleopController:
         self.ee_pos_r       = np.zeros(3)
         self.base_world_pos = np.zeros(3)
 
-    # ── base_yaw — uses integrated kinematic state ───────────────────────
+    # ── base_yaw — kinematically integrated yaw ──────────────────────────
 
     @property
     def base_yaw(self) -> float:
@@ -290,13 +309,11 @@ class TeleopController:
     def reset(self):
         mujoco.mj_resetData(self.m, self.d)
         qa = self._fj_qpos
-        self.d.qpos[qa + 2] = 0.1465
-        self.d.qpos[qa + 3] = 1.0
+        self.d.qpos[qa + 2] = self._base_z  # correct ground contact height
+        self.d.qpos[qa + 3] = 1.0            # identity quaternion (yaw = 0)
         mujoco.mj_forward(self.m, self.d)
 
-        self._vx = self._vy = self._yaw_rate = 0.0
-        self._yaw_des = 0.0
-        self._base_z  = float(self.d.qpos[qa + 2])
+        self._vx = self._yaw_rate = self._yaw_des = 0.0
         self._ik_tgt_l_base = self._world_to_base(self.d.xpos[self._ee_l].copy())
         self._ik_tgt_r_base = self._world_to_base(self.d.xpos[self._ee_r].copy())
         self._grip_l = self._grip_r = 0.0
@@ -392,51 +409,56 @@ class TeleopController:
         self._vx       = _accel(self._vx,       tvx,  K_ACCEL,     K_BRAKE,     dt)
         self._yaw_rate = _accel(self._yaw_rate, tyaw,  K_YAW_ACCEL, K_YAW_BRAKE, dt)
 
-        # Integrate desired yaw
+        # Integrate kinematic yaw (reliable even though physical yaw rotation
+        # is blocked by the model's internal wheel-chassis contacts).
         self._yaw_des += self._yaw_rate * dt
 
-        c, s_ = math.cos(self._yaw_des), math.sin(self._yaw_des)
-        wx = c * self._vx
-        wy = s_ * self._vx
-
-        # KINEMATIC: directly set base qpos — prevents gravity sinking
-        qa = self._fj_qpos
-        self.d.qpos[qa + 0] += wx * dt
-        self.d.qpos[qa + 1] += wy * dt
-        self.d.qpos[qa + 2]  = self._base_z   # locked height
-
-        hw = self._yaw_des * 0.5
-        self.d.qpos[qa + 3] = math.cos(hw)
-        self.d.qpos[qa + 4] = 0.0
-        self.d.qpos[qa + 5] = 0.0
-        self.d.qpos[qa + 6] = math.sin(hw)
-
-        # Set qvel so Jacobian-based IK sees correct base velocity
-        da = self._fj_dof
-        self.d.qvel[da + 0] = wx
-        self.d.qvel[da + 1] = wy
-        self.d.qvel[da + 2] = 0.0
-        self.d.qvel[da + 3] = 0.0
-        self.d.qvel[da + 4] = 0.0
-        self.d.qvel[da + 5] = self._yaw_rate
-
-        # Visual wheel animation (steer + drive actuators)
+        # Wheel commands in ROBOT frame (wxy = (px, py) wheel position).
+        # Steer: kinematic (set qpos) — bypasses the high-damping PD servo lag.
+        # Drive: physical velocity servo — generates real friction for X/Y motion.
         for name, wxy in WHEEL_XY.items():
-            wvx = wx  - self._yaw_rate * wxy[1]
-            wvy = wy  + self._yaw_rate * wxy[0]
-            spd = math.sqrt(wvx ** 2 + wvy ** 2)
-            ang = math.atan2(wvy, wvx) if spd > 0.01 else 0.0
+            wvx_rob = self._vx       - self._yaw_rate * wxy[1]
+            wvy_rob = 0.0            + self._yaw_rate * wxy[0]
+            spd = math.sqrt(wvx_rob ** 2 + wvy_rob ** 2)
+            ang = math.atan2(wvy_rob, wvx_rob) if spd > 0.01 else 0.0
             sign = 1.0
             if ang > math.pi / 2:
                 ang -= math.pi; sign = -1.0
             elif ang < -math.pi / 2:
                 ang += math.pi; sign = -1.0
-            self.d.ctrl[self._a_steer[name]] = ang
+            # Kinematic steer: zero error so PD holds in place
+            self.d.qpos[self._steer_qadr[name]] = ang
+            self.d.qvel[self._steer_dof[name]]  = 0.0
+            self.d.ctrl[self._a_steer[name]]    = ang
+            # Physical drive: creates real friction forces for X/Y translation
             self.d.ctrl[self._a_drive[name]] = sign * spd / WHEEL_RADIUS
 
+        qa = self._fj_qpos
         self.base_world_pos = np.array([float(self.d.qpos[qa]),
                                         float(self.d.qpos[qa + 1]),
                                         float(self.d.qpos[qa + 2])])
+
+    def apply_floor_constraint(self):
+        """Lock base z and set yaw from kinematic _yaw_des. Call after each mj_step.
+
+        X/Y are left to physics (wheel friction drives translation).
+        Yaw is set kinematically because the model's internal wheel-chassis contacts
+        block physical yaw rotation via wheel torques.
+        """
+        qa = self._fj_qpos
+        da = self._fj_dof
+        # Lock z to ground contact height
+        self.d.qpos[qa + 2] = self._base_z
+        self.d.qvel[da + 2] = 0.0
+        # Set yaw from kinematic integral; zero roll/pitch
+        hw = self._yaw_des * 0.5
+        self.d.qpos[qa + 3] = math.cos(hw)
+        self.d.qpos[qa + 4] = 0.0
+        self.d.qpos[qa + 5] = 0.0
+        self.d.qpos[qa + 6] = math.sin(hw)
+        # Zero roll/pitch angular velocities; leave yaw free from physics
+        self.d.qvel[da + 3] = 0.0
+        self.d.qvel[da + 4] = 0.0
 
     # ── Lift ─────────────────────────────────────────────────────────────
 
