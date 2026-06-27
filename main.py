@@ -51,7 +51,7 @@ sys.path.insert(0, SCRIPT_DIR)
 ASSET_BASE = os.path.join(SCRIPT_DIR, 'assets', 'ffw_sh5', 'robotis_ffw')
 ORIG_SCENE = os.path.join(ASSET_BASE, 'scene_ffw_sh5.xml')
 
-from robot.controller import TeleopController
+from robot.controller import TeleopController, FIN_L, FIN_R
 from robot.gui import ControlPanel
 from robot.task import CanPourTask
 
@@ -73,6 +73,83 @@ def _find_body(root, name: str):
             return found
         child = root.next_body(child)
     return None
+
+
+def _replace_finger_mesh_collision(spec, model_ref):
+    """손가락 mesh collision geom을 capsule로 교체.
+
+    mesh collision의 오목한 부분이 gap을 만들어 캔이 빠져나갈 수 있음.
+    캡슐은 완전 볼록(convex)이어서 gap-free 접촉을 보장한다.
+
+    all finger links have main axis along local Z — no rotation needed.
+    """
+    processed = set()
+    for jname in FIN_L + FIN_R:
+        jid0 = mujoco.mj_name2id(model_ref, mujoco.mjtObj.mjOBJ_JOINT, jname)
+        if jid0 < 0:
+            continue
+        bid0 = int(model_ref.jnt_bodyid[jid0])
+        if bid0 in processed:
+            continue
+        processed.add(bid0)
+
+        bname = mujoco.mj_id2name(model_ref, mujoco.mjtObj.mjOBJ_BODY, bid0) or ''
+        if not bname:
+            continue
+
+        body = _find_body(spec.worldbody, bname)
+        if body is None:
+            continue
+
+        # 1. 기존 mesh collision geom 비활성화
+        g = body.first_geom()
+        while g is not None:
+            if g.group == 3:
+                g.contype     = 0
+                g.conaffinity = 0
+            try:
+                g = body.next_geom(g)
+            except Exception:
+                break
+
+        # 2. mesh AABB로 capsule 크기 계산
+        coll_gid = -1
+        for gi in range(model_ref.ngeom):
+            if (model_ref.geom_bodyid[gi] == bid0 and
+                    model_ref.geom_contype[gi] == 1 and
+                    model_ref.geom_type[gi] == 7):
+                coll_gid = gi
+                break
+        if coll_gid < 0:
+            continue
+
+        mid  = int(model_ref.geom_dataid[coll_gid])
+        va   = model_ref.mesh_vertadr[mid]
+        nv   = model_ref.mesh_vertnum[mid]
+        verts = model_ref.mesh_vert[va:va+nv].reshape(-1, 3)
+
+        xs, xe = float(verts[:,0].min()), float(verts[:,0].max())
+        ys, ye = float(verts[:,1].min()), float(verts[:,1].max())
+        zs, ze = float(verts[:,2].min()), float(verts[:,2].max())
+
+        spans  = sorted([xe-xs, ye-ys, ze-zs])
+        radius = spans[0] / 2 * 0.90          # 가장 얇은 축 → 반지름
+        radius = max(0.006, min(radius, 0.014))
+        hl     = max(0.003, spans[2] / 2 - radius)  # 가장 긴 축 → 반길이
+
+        # 3. capsule 추가 (local Z축 기본 방향)
+        cap = body.add_geom()
+        cap.type        = mujoco.mjtGeom.mjGEOM_CAPSULE
+        cap.pos         = [(xs+xe)/2, (ys+ye)/2, (zs+ze)/2]
+        cap.size        = [radius, hl, 0]
+        cap.contype     = 1
+        cap.conaffinity = 1
+        cap.group       = 3
+        cap.density     = 0       # 질량 기여 없음
+        cap.friction    = [2.0, 0.05, 0.01]
+        cap.solimp      = [0.95, 0.99, 0.001, 0.5, 2]
+        cap.margin      = 0.001   # 1mm 조기 감지
+        cap.rgba        = [0.3, 0.7, 1.0, 0.0]  # 불투명도 0 (충돌만)
 
 
 def _add_palm_fill(spec, base_name: str):
@@ -102,9 +179,17 @@ def _add_palm_fill(spec, base_name: str):
 
 def build_scene() -> mujoco.MjModel:
     """FFW-SH5 scene에 table + can을 동적으로 추가."""
+    # ── 1차 컴파일: mesh AABB 측정용 (table/can 없는 원본 XML) ────────────
+    _spec_ref  = mujoco.MjSpec.from_file(ORIG_SCENE)
+    _model_ref = _spec_ref.compile()
+
+    # ── 메인 spec: 모든 수정 적용 후 최종 컴파일 ─────────────────────────
     spec = mujoco.MjSpec.from_file(ORIG_SCENE)
 
-    # Palm 내부 채움 geom 추가 (캔 관통 방지) — compile 전에 적용
+    # 손가락 mesh collision → capsule 교체 (gap-free 접촉)
+    _replace_finger_mesh_collision(spec, _model_ref)
+
+    # Palm 내부 채움 geom (캔 관통 방지)
     _add_palm_fill(spec, 'hx5_l_base')
     _add_palm_fill(spec, 'hx5_r_base')
 
