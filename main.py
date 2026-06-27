@@ -219,7 +219,8 @@ def build_scene() -> mujoco.MjModel:
         leg.rgba = [0.50, 0.30, 0.15, 1]
 
     # 캔 (dynamic, freejoint) — 테이블 위에 올려놓기 (can half-height = 0.055m)
-    CAN_Z = TABLE_H + 0.055
+    CAN_HALF_H = 0.075             # 반높이 0.075m → 전체 높이 15cm
+    CAN_Z = TABLE_H + CAN_HALF_H
     can = wb.add_body()
     can.name = 'can'
     can.pos  = [0.85, 0.15, CAN_Z]
@@ -230,7 +231,7 @@ def build_scene() -> mujoco.MjModel:
     cg = can.add_geom()
     cg.name     = 'can_geom'
     cg.type     = mujoco.mjtGeom.mjGEOM_CYLINDER
-    cg.size     = [0.033, 0.055, 0]
+    cg.size     = [0.033, CAN_HALF_H, 0]
     cg.rgba     = [0.85, 0.15, 0.15, 1]
     cg.mass     = 0.20          # lighter can — easier to lift (was 0.35 kg)
     cg.friction = [2.0, 0.05, 0.01]  # rubber-grip surface (was 0.8, 0.005, 0.0001)
