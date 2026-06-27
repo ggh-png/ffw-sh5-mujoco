@@ -103,7 +103,7 @@ def build_scene() -> mujoco.MjModel:
     cg = can.add_geom()
     cg.name     = 'can_geom'
     cg.type     = mujoco.mjtGeom.mjGEOM_CYLINDER
-    cg.size     = [0.033, CAN_HALF_H, 0]
+    cg.size     = [0.040, CAN_HALF_H, 0]
     cg.rgba     = [0.85, 0.15, 0.15, 1]
     cg.mass     = 0.20          # lighter can — easier to lift (was 0.35 kg)
     cg.friction = [2.0, 0.05, 0.01]  # rubber-grip surface (was 0.8, 0.005, 0.0001)
