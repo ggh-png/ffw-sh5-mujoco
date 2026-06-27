@@ -59,7 +59,7 @@ from robot.task import CanPourTask
 # physics timestep 은 model.opt.timestep (보통 0.002s = 500 Hz)
 # 렌더는 ~60 Hz → 1프레임당 약 8 물리 스텝
 RENDER_HZ  = 60
-N_SUBSTEPS = 16  # 물리 스텝 수 per 렌더 프레임 — 2× for better contact resolution
+N_SUBSTEPS = 8   # 물리 스텝 수 per 렌더 프레임 (= 500/60 ≈ 8)
 
 
 def build_scene() -> mujoco.MjModel:

@@ -276,12 +276,6 @@ class TeleopController:
                 model.geom_friction[_gi, 0] = 2.0   # sliding — was 1.0
                 model.geom_friction[_gi, 1] = 0.05  # torsional — was 0.005
                 model.geom_friction[_gi, 2] = 0.01  # rolling   — was 0.0001
-                model.geom_condim[_gi]      = 4     # sliding + torsional
-                # Stiffer contact: default solimp[0]=0.9 → near-rigid 0.99
-                model.geom_solimp[_gi, 0] = 0.97   # min impedance
-                model.geom_solimp[_gi, 1] = 0.999  # max impedance (near-rigid)
-                model.geom_solimp[_gi, 2] = 0.001  # damping margin
-                model.geom_solref[_gi, 0] = 0.005  # timeconst — stiffer (was 0.02)
 
         # Joint addresses
         fj = jid('floating_base')
