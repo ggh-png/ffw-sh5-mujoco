@@ -16,9 +16,12 @@ FK mode  (Tab to toggle)
   I/K           Adjust selected joint
   Home/End/Del  Jump to max / min / zero
 
-Hand
-  Z / C         Left hand  close / open
-  X / V         Right hand close / open
+Hand (hold key)
+  Z / C         Left  3-finger (index/middle/ring) close / open
+  X / V         Right 3-finger close / open
+  A / S         Left  thumb close / open
+  H / N         Right thumb close / open
+  (pinky always extended; thumb independent of 3-finger)
 
 Common
   F    Camera-follow toggle
@@ -42,7 +45,7 @@ except ImportError:
     _HAS_GLFW = False
 
 # ── GLFW key codes ────────────────────────────────────────────────────────
-_K: dict[str, int] = {c: ord(c) for c in 'QEIJKLUOZXCV12FGR'}
+_K: dict[str, int] = {c: ord(c) for c in 'QEIJKLUOZXCV12FGRP34567890ASHN'}
 _K.update({
     'UP':     265,
     'DOWN':   264,
@@ -61,6 +64,7 @@ _K.update({
 BASE_MAX_SPD  = 0.55   # m/s
 YAW_MAX_SPD   = 1.20   # rad/s
 IK_SPEED      = 0.40   # m/s
+IK_ROT_SPEED  = 0.50   # rad/s — EE orientation control
 FK_SPEED      = 0.80   # rad/s
 GRIP_SPEED    = 1.50   # full range (0→1) per second
 LIFT_STEP     = 0.003  # m per update
@@ -94,16 +98,12 @@ ARM_R = [f'arm_r_joint{i}' for i in range(1, 8)]
 FIN_L = [f'finger_l_joint{i}' for i in range(1, 21)]
 FIN_R = [f'finger_r_joint{i}' for i in range(1, 21)]
 
-# Open-hand neutral angles (same as original implementation)
-OPEN_ANGLE: dict[str, float] = {}
-for _jn in FIN_L:
-    _ix = int(_jn.split('joint')[1])
-    OPEN_ANGLE[_jn] = (math.pi / 2 if _ix == 2 else
-                       math.pi / 2 if _ix in (6, 10, 14, 18) else 0.0)
-for _jn in FIN_R:
-    _ix = int(_jn.split('joint')[1])
-    OPEN_ANGLE[_jn] = (-math.pi / 2 if _ix == 2 else
-                        math.pi / 2 if _ix in (6, 10, 14, 18) else 0.0)
+# Finger group layout (per hand, 20 joints total)
+# joint 1-4  : thumb (abduction, MCP, PIP, DIP)
+# joint 5-8  : index  (spread, MCP, PIP, DIP)
+# joint 9-12 : middle (spread, MCP, PIP, DIP)
+# joint 13-16: ring   (spread, MCP, PIP, DIP)
+# joint 17-20: pinky  — fixed extended (always 0°)
 
 
 # ── ASCII progress bar helpers ──────────────────────────────────────────
@@ -148,6 +148,32 @@ def _ik_err_tag(err_mm: float) -> str:
     if err_mm < 20.0:
         return '~'
     return '!'
+
+
+def _apply_world_rpy(quat: np.ndarray, drpy: np.ndarray) -> np.ndarray:
+    """World-frame RPY 증분 drpy[roll,pitch,yaw] (rad)을 쿼터니언에 적용."""
+    q = quat.copy()
+    for i in range(3):
+        if abs(drpy[i]) < 1e-9:
+            continue
+        ax = np.zeros(3)
+        ax[i] = 1.0
+        dq = np.zeros(4)
+        mujoco.mju_axisAngle2Quat(dq, ax, drpy[i])
+        tmp = np.zeros(4)
+        mujoco.mju_mulQuat(tmp, dq, q)    # world-frame: 좌측 곱
+        q = tmp / (np.linalg.norm(tmp) + 1e-15)
+    return q
+
+
+def _quat_to_rpy(q: np.ndarray) -> tuple:
+    """쿼터니언 [w,x,y,z] → (roll, pitch, yaw) in radians."""
+    w, x, y, z = q
+    roll  = math.atan2(2 * (w*x + y*z), 1 - 2 * (x*x + y*y))
+    sinp  = 2 * (w*y - z*x)
+    pitch = math.asin(max(-1.0, min(1.0, sinp)))
+    yaw   = math.atan2(2 * (w*z + x*y), 1 - 2 * (y*y + z*z))
+    return roll, pitch, yaw
 
 
 def _accel(cur: float, tgt: float, ac: float, br: float, dt: float) -> float:
@@ -212,6 +238,17 @@ class TeleopController:
         self._a_fin_l = {n: try_aid(n) for n in FIN_L}
         self._a_fin_r = {n: try_aid(n) for n in FIN_R}
 
+        # Boost finger PD gains at runtime.
+        # XML default kp≈20 → fingers take ~2 s to close (too slow for interactive use).
+        # kp=150 + matching biasprm[1] + kv=10 → ~0.3 s close time.
+        _FIN_KP, _FIN_KV = 150.0, 10.0
+        for _n in FIN_L + FIN_R:
+            _a = try_aid(_n)
+            if _a is not None:
+                model.actuator_gainprm[_a, 0] = _FIN_KP
+                model.actuator_biasprm[_a, 1] = -_FIN_KP  # position bias must match gain
+                model.actuator_biasprm[_a, 2] = -_FIN_KV
+
         # Joint addresses
         fj = jid('floating_base')
         self._fj_qpos = model.jnt_qposadr[fj]
@@ -248,6 +285,22 @@ class TeleopController:
         self._ee_l = bid('hx5_l_base')
         self._ee_r = bid('hx5_r_base')
 
+        # Palm center: mean world pos of index/middle/ring finger spread-joint bodies.
+        # These are children of the EE body; at rest (spread=0°) they define the
+        # palm grasp center ~10 cm below the wrist in world-z.
+        def _palm_bids(spread_joints):
+            bids = []
+            for n in spread_joints:
+                j = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)
+                if j >= 0:
+                    bids.append(int(model.jnt_bodyid[j]))
+            return bids
+
+        self._palm_l_bids = _palm_bids(
+            ['finger_l_joint5', 'finger_l_joint9', 'finger_l_joint13'])
+        self._palm_r_bids = _palm_bids(
+            ['finger_r_joint5', 'finger_r_joint9', 'finger_r_joint13'])
+
         jl1_bid = model.jnt_bodyid[jid('arm_l_joint1')]
         jr1_bid = model.jnt_bodyid[jid('arm_r_joint1')]
         self._shoulder_l_bid = model.body_parentid[jl1_bid]
@@ -275,14 +328,25 @@ class TeleopController:
         self._ik_err_l = 0.0
         self._ik_err_r = 0.0
 
+        # 6DOF IK: target quaternion [w,x,y,z] in world frame
+        self._ik_tgt_l_quat = np.array([1., 0., 0., 0.])
+        self._ik_tgt_r_quat = np.array([1., 0., 0., 0.])
+        self._use_ori_ik    = False   # 키 9로 토글
+        self._use_palm_ik   = False   # 키 0: 손바닥 중심 IK (캔 파지 후 기울이기용)
+
+        # Desired lift position (separate from qpos to prevent gravity sag)
+        self._lift_des = 0.0
+
         # FK state
         self._mode     = 'ik'
         self._fk_joint = 0
         self._fk_arm   = 'l'
 
-        # Grip state (0=open, 1=closed)
-        self._grip_l = 0.0
-        self._grip_r = 0.0
+        # Grip state: 3-finger (index/middle/ring) + thumb separately
+        self._grip_l  = 0.0   # Z/C
+        self._grip_r  = 0.0   # X/V
+        self._thumb_l = 0.0   # A/S
+        self._thumb_r = 0.0   # H/N
 
         # Misc state
         self.show_gizmo  = True
@@ -297,6 +361,9 @@ class TeleopController:
         self.ee_pos_l       = np.zeros(3)
         self.ee_pos_r       = np.zeros(3)
         self.base_world_pos = np.zeros(3)
+
+        # Autonomous task (set externally after construction)
+        self.task = None
 
     # ── base_yaw — kinematically integrated yaw ──────────────────────────
 
@@ -316,15 +383,19 @@ class TeleopController:
         self._vx = self._yaw_rate = self._yaw_des = 0.0
         self._ik_tgt_l_base = self._world_to_base(self.d.xpos[self._ee_l].copy())
         self._ik_tgt_r_base = self._world_to_base(self.d.xpos[self._ee_r].copy())
+        self._ik_tgt_l_quat = self.d.xquat[self._ee_l].copy()
+        self._ik_tgt_r_quat = self.d.xquat[self._ee_r].copy()
+        self._lift_des = float(self.d.qpos[self._j_lift_qadr])
         self._grip_l = self._grip_r = 0.0
+        self._thumb_l = self._thumb_r = 0.0
         self._mode = 'ik'
 
         if self._can_qadr is not None:
             self._can_init_qpos = self.d.qpos[self._can_qadr: self._can_qadr + 7].copy()
 
-        # Fully open hand (grip=0 → all joints at 0)
-        self._apply_grip('l', 0.0)
-        self._apply_grip('r', 0.0)
+        # Fully open hand (all joints to 0° = extended)
+        self._apply_grip('l', 0.0, 0.0)
+        self._apply_grip('r', 0.0, 0.0)
         self._wall_t0 = time.perf_counter()
 
         for k in WHEEL_XY:
@@ -350,12 +421,20 @@ class TeleopController:
         # Mode switch
         if key == _K['TAB']:
             if self._mode == 'ik':
+                # IK→FK: sync arm ctrls to current qpos so PD doesn't fight FK moves
+                mujoco.mj_forward(self.m, self.d)
+                for qadr, a in zip(self._jl_qadrs, self._a_arm_l):
+                    self.d.ctrl[a] = float(self.d.qpos[qadr])
+                for qadr, a in zip(self._jr_qadrs, self._a_arm_r):
+                    self.d.ctrl[a] = float(self.d.qpos[qadr])
                 self._mode = 'fk'
             else:
                 self._ik_tgt_l_base = self._world_to_base(
                     self.d.xpos[self._ee_l].copy())
                 self._ik_tgt_r_base = self._world_to_base(
                     self.d.xpos[self._ee_r].copy())
+                self._ik_tgt_l_quat = self.d.xquat[self._ee_l].copy()
+                self._ik_tgt_r_quat = self.d.xquat[self._ee_r].copy()
                 self._mode = 'ik'
 
         # FK joint selection + quick-set
@@ -380,6 +459,31 @@ class TeleopController:
             self._reset_can()
         if key == _K['F11']:
             self._toggle_fullscreen()
+        if key == _K['9']:
+            self._use_ori_ik = not self._use_ori_ik
+            if self._use_ori_ik:
+                # 현재 EE 자세를 목표로 초기화
+                self._ik_tgt_l_quat = self.d.xquat[self._ee_l].copy()
+                self._ik_tgt_r_quat = self.d.xquat[self._ee_r].copy()
+        if key == _K['0']:
+            self._use_palm_ik = not self._use_palm_ik
+            if self._mode == 'ik':
+                # IK 기준점 전환 시 현재 위치에서 타겟 재초기화 (팔 급격한 움직임 방지)
+                if self._use_palm_ik:
+                    self._ik_tgt_l_base = self._world_to_base(self._palm_center('l'))
+                    self._ik_tgt_r_base = self._world_to_base(self._palm_center('r'))
+                else:
+                    self._ik_tgt_l_base = self._world_to_base(self.d.xpos[self._ee_l].copy())
+                    self._ik_tgt_r_base = self._world_to_base(self.d.xpos[self._ee_r].copy())
+        if key == _K['P']:
+            if self.task is not None:
+                self.task.trigger()
+                # 태스크 시작 시 IK 모드 강제 전환
+                if self.task.is_active():
+                    self._mode = 'ik'
+                    self._ik_tgt_r_base = self._world_to_base(
+                        self.d.xpos[self._ee_r].copy()
+                    )
 
     # ── Main update ──────────────────────────────────────────────────────
 
@@ -463,17 +567,22 @@ class TeleopController:
     # ── Lift ─────────────────────────────────────────────────────────────
 
     def _update_lift(self, dt: float):
-        qa     = self._j_lift_qadr
         lo, hi = self._j_lift_range
         delta  = (float(self.ks.is_down(_K['Q'])) -
                   float(self.ks.is_down(_K['E']))) * LIFT_STEP
         if delta != 0.0:
-            self.d.qpos[qa] = float(np.clip(self.d.qpos[qa] + delta, lo, hi))
-        self.d.ctrl[self._a_lift] = self.d.qpos[qa]
+            self._lift_des = float(np.clip(self._lift_des + delta, lo, hi))
+        # Kinematic hold: override qpos + ctrl every frame → prevents gravity sag.
+        # (Previously ctrl = current qpos → PD restoring force = 0 → slow sinking)
+        self.d.qpos[self._j_lift_qadr] = self._lift_des
+        self.d.ctrl[self._a_lift]      = self._lift_des
 
     # ── IK target update (base-frame, continuous velocity) ───────────────
 
     def _update_ik_targets(self, dt: float):
+        # 태스크 활성 중 키보드 IK 입력 차단 (태스크가 직접 _ik_tgt_*_base 설정)
+        if self.task is not None and self.task.is_active():
+            return
         ks   = self.ks
         do_l = not ks.is_down(_K['2'])
         do_r = not ks.is_down(_K['1'])
@@ -492,6 +601,17 @@ class TeleopController:
             self._ik_tgt_r_base = self._clamp_ws(self._ik_tgt_r_base,
                                                    self._shoulder_r_bid)
 
+        # 자세 IK 활성 시: 3/4=roll  5/6=pitch  7/8=yaw (world frame)
+        if self._use_ori_ik:
+            rd = float(ks.is_down(_K['3'])) - float(ks.is_down(_K['4']))
+            pd = float(ks.is_down(_K['5'])) - float(ks.is_down(_K['6']))
+            yd = float(ks.is_down(_K['7'])) - float(ks.is_down(_K['8']))
+            drpy = np.array([rd, pd, yd]) * (IK_ROT_SPEED * dt)
+            if do_l and np.any(drpy != 0):
+                self._ik_tgt_l_quat = _apply_world_rpy(self._ik_tgt_l_quat, drpy)
+            if do_r and np.any(drpy != 0):
+                self._ik_tgt_r_quat = _apply_world_rpy(self._ik_tgt_r_quat, drpy)
+
     # ── IK solver (convex QP / BVLS) ────────────────────────────────────
 
     def _update_ik(self):
@@ -502,20 +622,40 @@ class TeleopController:
 
         self.ik_world_tgt_l = tgt_l
         self.ik_world_tgt_r = tgt_r
-        self.ee_pos_l = self.d.xpos[self._ee_l].copy()
-        self.ee_pos_r = self.d.xpos[self._ee_r].copy()
+        # In palm IK mode the gizmo tracks the palm center; otherwise the EE body.
+        if self._use_palm_ik:
+            self.ee_pos_l = self._palm_center('l')
+            self.ee_pos_r = self._palm_center('r')
+        else:
+            self.ee_pos_l = self.d.xpos[self._ee_l].copy()
+            self.ee_pos_r = self.d.xpos[self._ee_r].copy()
+
+        # 태스크 활성 중 자세 IK 비활성 (도달성 우선)
+        task_active = self.task is not None and self.task.is_active()
+        ori_l = self._ik_tgt_l_quat if (self._use_ori_ik and not task_active) else None
+        ori_r = self._ik_tgt_r_quat if (self._use_ori_ik and not task_active) else None
+
+        palm_l = self._palm_l_bids if self._use_palm_ik else None
+        palm_r = self._palm_r_bids if self._use_palm_ik else None
 
         self._ik_err_l = qp_ik(
             self.m, self.d, self._ee_l, tgt_l,
-            self._jl_dadrs, self._jl_qadrs)
-        self._ik_err_r = qp_ik(
-            self.m, self.d, self._ee_r, tgt_r,
-            self._jr_dadrs, self._jr_qadrs)
-
+            self._jl_dadrs, self._jl_qadrs,
+            target_quat=ori_l,
+            palm_body_ids=palm_l)
         for aid, qadr in zip(self._a_arm_l, self._jl_qadrs):
-            self.d.ctrl[aid] = self.d.qpos[qadr]
-        for aid, qadr in zip(self._a_arm_r, self._jr_qadrs):
-            self.d.ctrl[aid] = self.d.qpos[qadr]
+            self.d.ctrl[aid] = float(self.d.qpos[qadr])
+
+        # POUR 상태에서 suppress_ik_r=True → 오른팔 IK 비활성 (태스크가 FK 직접 제어)
+        suppress_r = self.task is not None and self.task.suppress_ik_r
+        if not suppress_r:
+            self._ik_err_r = qp_ik(
+                self.m, self.d, self._ee_r, tgt_r,
+                self._jr_dadrs, self._jr_qadrs,
+                target_quat=ori_r,
+                palm_body_ids=palm_r)
+            for aid, qadr in zip(self._a_arm_r, self._jr_qadrs):
+                self.d.ctrl[aid] = float(self.d.qpos[qadr])
 
     # ── FK quick-set (Home/End/Del) ───────────────────────────────────────
 
@@ -573,22 +713,37 @@ class TeleopController:
     def _update_grip(self, dt: float):
         ks = self.ks
         step = GRIP_SPEED * dt
-        # Left: Z=close  C=open
-        if ks.is_down(_K['Z']):
-            self._grip_l = min(1.0, self._grip_l + step)
-        elif ks.is_down(_K['C']):
-            self._grip_l = max(0.0, self._grip_l - step)
-        # Right: X=close  V=open
-        if ks.is_down(_K['X']):
-            self._grip_r = min(1.0, self._grip_r + step)
-        elif ks.is_down(_K['V']):
-            self._grip_r = max(0.0, self._grip_r - step)
 
-        self._apply_grip('l', self._grip_l)
-        self._apply_grip('r', self._grip_r)
+        # Left hand: always keyboard-controllable — task never touches _grip_l.
+        if ks.is_down(_K['Z']):   self._grip_l = min(1.0, self._grip_l + step)
+        elif ks.is_down(_K['C']): self._grip_l = max(0.0, self._grip_l - step)
+        if ks.is_down(_K['A']):   self._thumb_l = min(1.0, self._thumb_l + step)
+        elif ks.is_down(_K['S']): self._thumb_l = max(0.0, self._thumb_l - step)
 
-    def _apply_grip(self, side: str, grip: float):
-        """Apply grip ∈ [0,1] using the original motion profile."""
+        # Right hand: blocked while task is active (task owns _grip_r directly).
+        task_active = self.task is not None and self.task.is_active()
+        if not task_active:
+            if ks.is_down(_K['X']):   self._grip_r = min(1.0, self._grip_r + step)
+            elif ks.is_down(_K['V']): self._grip_r = max(0.0, self._grip_r - step)
+            if ks.is_down(_K['H']):   self._thumb_r = min(1.0, self._thumb_r + step)
+            elif ks.is_down(_K['N']): self._thumb_r = max(0.0, self._thumb_r - step)
+
+        self._apply_grip('l', self._grip_l, self._thumb_l)
+        self._apply_grip('r', self._grip_r, self._thumb_r)
+
+    def _apply_grip(self, side: str, grip: float, thumb: float):
+        """
+        grip  ∈ [0,1]: 검지/중지/약지 (3-finger) — Z/C (L), X/V (R)
+        thumb ∈ [0,1]: 엄지 단독 — A/S (L), H/N (R)
+        새끼(pinky, joint17-20)는 항상 0° (완전히 편 상태).
+
+        Finger layout (per hand):
+          idx 1-4  : 엄지 (abduction, MCP, PIP, DIP)
+          idx 5-8  : 검지  (spread, MCP, PIP, DIP)
+          idx 9-12 : 중지  (spread, MCP, PIP, DIP)
+          idx 13-16: 약지  (spread, MCP, PIP, DIP)
+          idx 17-20: 새끼  → 0° 고정
+        """
         s    = 1.0 if side == 'l' else -1.0
         info = self._fin_l_info if side == 'l' else self._fin_r_info
         act  = self._a_fin_l    if side == 'l' else self._a_fin_r
@@ -597,25 +752,29 @@ class TeleopController:
             a_id = act.get(jname)
             if a_id is None:
                 continue
-            idx      = int(jname.split('joint')[1])
-            open_val = OPEN_ANGLE.get(jname, 0.0)
+            idx = int(jname.split('joint')[1])
 
-            if idx <= 4:
-                if idx == 2:
-                    target = open_val
-                elif idx in (3, 4):
-                    close  = s * (-math.pi / 3)
-                    target = open_val + (close - open_val) * grip
-                else:
-                    target = open_val
-            else:
-                phase = (idx - 5) % 4
+            if idx == 1:
+                # 엄지 내전/외전: 중립 고정
+                target = 0.0
+            elif idx == 2:
+                # 엄지 MCP: L=0→+90°, R=0→-90°
+                target = s * (math.pi / 2) * thumb
+            elif idx in (3, 4):
+                # 엄지 PIP/DIP: L=0→-60°, R=0→+60°
+                target = s * (-math.pi / 3) * thumb
+            elif 5 <= idx <= 16:
+                # 검지/중지/약지 (3-finger 공통)
+                phase = (idx - 5) % 4   # 0=spread, 1=MCP, 2=PIP, 3=DIP
                 if phase == 0:
-                    target = open_val - grip * 0.15
+                    target = 0.0                          # 손가락 벌림: 중립
                 elif phase == 1:
-                    target = open_val + grip * (math.pi / 4)
+                    target = (math.pi / 2) * grip         # MCP: 0°→90°
                 else:
-                    target = open_val + grip * (math.pi / 3)
+                    target = (math.pi / 3) * grip         # PIP/DIP: 0°→60°
+            else:
+                # 새끼(17-20): 항상 완전히 펴진 상태
+                target = 0.0
 
             self.d.ctrl[a_id] = float(np.clip(target, lo, hi))
 
@@ -679,6 +838,14 @@ class TeleopController:
         if dist > IK_WORKSPACE:
             delta *= IK_WORKSPACE / dist
         return sh_base + delta
+
+    def _palm_center(self, side: str) -> np.ndarray:
+        """World position of the palm grasp center (mean of index/middle/ring bases)."""
+        bids = self._palm_l_bids if side == 'l' else self._palm_r_bids
+        if bids:
+            return np.mean([self.d.xpos[b] for b in bids], axis=0)
+        ee = self._ee_l if side == 'l' else self._ee_r
+        return self.d.xpos[ee].copy()
 
     # ── Overlay entry point ───────────────────────────────────────────────
 
@@ -784,6 +951,7 @@ class TeleopController:
         mode_str = self._mode.upper()
         arm_str  = ('BOTH' if self._mode == 'ik' else
                     ('L' if self._fk_arm == 'l' else 'R'))
+        palm_str = 'Palm:ON' if self._use_palm_ik else 'Palm:off'
 
         # IK target bars - show L/R on consecutive lines per axis
         def ik_rows():
@@ -810,13 +978,30 @@ class TeleopController:
                 parts.append(f'J{i+1}{bar}{deg:+.0f}')
             return f' {label}: ' + '  '.join(parts)
 
-        # Grip bars
-        gl_pct = int(self._grip_l * 100)
-        gr_pct = int(self._grip_r * 100)
-        gl_bar = _pbar(self._grip_l, 0.0, 1.0, 12)[:-1] + ' '
-        gr_bar = _pbar(self._grip_r, 0.0, 1.0, 12)[:-1] + ' '
-        gl_str = 'CLOSED' if self._grip_l > 0.8 else ('GRIP' if self._grip_l > 0.1 else 'open')
-        gr_str = 'CLOSED' if self._grip_r > 0.8 else ('GRIP' if self._grip_r > 0.1 else 'open')
+        # Grip bars (3-finger)
+        gl_pct = int(self._grip_l  * 100)
+        gr_pct = int(self._grip_r  * 100)
+        tl_pct = int(self._thumb_l * 100)
+        tr_pct = int(self._thumb_r * 100)
+        gl_bar = _pbar(self._grip_l,  0.0, 1.0, 10)
+        gr_bar = _pbar(self._grip_r,  0.0, 1.0, 10)
+        tl_bar = _pbar(self._thumb_l, 0.0, 1.0, 8)
+        tr_bar = _pbar(self._thumb_r, 0.0, 1.0, 8)
+
+        # Orientation target in degrees
+        rl, pl, yl = _quat_to_rpy(self._ik_tgt_l_quat)
+        rr, pr, yr = _quat_to_rpy(self._ik_tgt_r_quat)
+        ori_on = 'ON' if self._use_ori_ik else 'off'
+        ori_lines = [
+            f'--- Orientation IK [9=toggle: {ori_on}] ---',
+            f' L R:{math.degrees(rl):+6.1f} P:{math.degrees(pl):+6.1f} Y:{math.degrees(yl):+6.1f} deg',
+            f' R R:{math.degrees(rr):+6.1f} P:{math.degrees(pr):+6.1f} Y:{math.degrees(yr):+6.1f} deg',
+        ]
+
+        task_grip_block = self.task is not None and self.task.is_active()
+        r_suffix = ' [TASK]' if task_grip_block else (
+            f'  [X{"▼" if self.ks.is_down(_K["X"]) else " "}'
+            f' V{"▼" if self.ks.is_down(_K["V"]) else " "}]')
 
         return '\n'.join([
             '--- Telemetry ---',
@@ -824,15 +1009,18 @@ class TeleopController:
             f' Freq {freq:7.1f} Hz',
             f' IK-L {el:6.1f}mm [{tag_l}]   IK-R {er:6.1f}mm [{tag_r}]',
             '',
-            f'--- IK Targets  Mode:{mode_str} Arm:{arm_str} ---',
+            f'--- IK Targets  Mode:{mode_str} Arm:{arm_str}  {palm_str} ---',
             ik_rows(),
             '--- Wrist (J5/6/7) ---',
             wrist_row('L', self._jl_qadrs, self._jl_ranges),
             wrist_row('R', self._jr_qadrs, self._jr_ranges),
             '',
-            '--- Hand (Z/C=L-close/open  X/V=R) ---',
-            f' L ({gl_str}) {gl_bar} {gl_pct:3d}%',
-            f' R ({gr_str}) {gr_bar} {gr_pct:3d}%',
+            *ori_lines,
+            '',
+            '--- Hand ---',
+            f' L 3fin {gl_bar}{gl_pct:3d}%  thumb {tl_bar}{tl_pct:3d}%'
+            f'  [Z{"▼" if self.ks.is_down(_K["Z"]) else " "} C{"▼" if self.ks.is_down(_K["C"]) else " "}]',
+            f' R 3fin {gr_bar}{gr_pct:3d}%  thumb {tr_bar}{tr_pct:3d}%{r_suffix}',
         ])
 
     # ── Panel: status ─────────────────────────────────────────────────────
@@ -863,11 +1051,15 @@ class TeleopController:
         win_hint = ('F11=exit-FS' if self._fullscreen
                     else 'drag-edge=resize  drag-title=move  F11=fullscreen')
 
-        return '\n'.join([
+        lines = [
             f'Mode:{mode_disp}',
             f'Base ({bx:+.2f},{by:+.2f}) yaw={deg:+.1f}  spd={spd:.2f}m/s  rot={yr:+.1f}deg/s',
             f'Cam:{cam_s} Gizmo:{giz_s} FS:{fs_s}   {win_hint}',
-        ])
+        ]
+        if self.task is not None:
+            lines.append('')
+            lines.append(self.task.hud_text())
+        return '\n'.join(lines)
 
     # ── Panel: controls ───────────────────────────────────────────────────
 
@@ -881,7 +1073,10 @@ class TeleopController:
             'Tab=FK/IK mode',
             '',
             '[ IK mode ]',
-            ' I/K J/L U/O = EE fwd/bk lat up/dn',
+            ' I/K J/L U/O = EE pos fwd/bk lat up/dn',
+            ' 9=ori-IK-toggle  (when ON:)',
+            '  3/4=roll  5/6=pitch  7/8=yaw',
+            ' 0=palm-center IK toggle',
             ' hold 1=L-only  hold 2=R-only',
             '',
             '[ FK mode ]  sel:' + fk_sel,
@@ -889,8 +1084,11 @@ class TeleopController:
             ' Home=max  End=min  Del=zero',
             '',
             'Hand (hold key)',
-            ' Z=L-close  C=L-open',
-            ' X=R-close  V=R-open',
+            ' Z/C = L 3-finger close/open',
+            ' X/V = R 3-finger close/open',
+            ' A/S = L thumb  close/open',
+            ' H/N = R thumb  close/open',
+            '  (pinky always extended)',
             '',
             'F=cam  G=gizmo  R=reset  F11=FS',
         ])

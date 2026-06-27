@@ -70,6 +70,17 @@ def render(scn, ctrl):
     _cylinder(scn, ee_l, tgt_l, 0.004, [0.10, 0.90, 0.10, 0.45])
     _cylinder(scn, ee_r, tgt_r, 0.004, [0.10, 0.80, 0.90, 0.45])
 
+    # 태스크 활성 시: 파지점 / 접근점 마커
+    task = getattr(ctrl, 'task', None)
+    if task is not None and task.is_active():
+        vis = task.vis_target
+        if vis is not None:
+            _sphere(scn, vis, 0.022, [1.00, 0.85, 0.00, 0.90])   # 노란색: 현재 목표
+        if task.grasp_pos is not None:
+            _sphere(scn, task.grasp_pos, 0.015, [1.00, 0.40, 0.00, 0.70])  # 주황: 파지점
+        if task.pre_grasp_pos is not None:
+            _sphere(scn, task.pre_grasp_pos, 0.012, [0.80, 0.80, 0.00, 0.60])  # 연노랑: 접근점
+
     if ctrl.show_gizmo:
         p  = ctrl.base_world_pos.copy()
         yaw = ctrl.base_yaw

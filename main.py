@@ -6,13 +6,15 @@ Run:  cd /home/ggh/ffw-sh5-mujoco && bash run.sh
 
 Controls
 --------
-WASD            베이스 이동 (로봇 기준계)
+↑/↓             베이스 전후 이동
 ←/→             베이스 yaw 회전
 Q/E             리프트 상승/하강
 Tab             FK ↔ IK 모드 전환
 
 IK 모드
   I/K J/L U/O  EE 이동 (전후, 좌우, 상하)
+  9             자세 IK 토글  (ON시: 3/4=roll 5/6=pitch 7/8=yaw)
+  0             손바닥 중심 IK 토글 (캔 파지 후 기울이기 — 손바닥 중심 기준 회전)
   hold 1        왼팔만
   hold 2        오른팔만
 
@@ -20,8 +22,16 @@ FK 모드
   1/2           왼팔 / 오른팔 선택
   [/]           조인트 선택 (J1 ↔ J7)
   I/K           선택 조인트 증가/감소
+  Home/End/Del  최대/최소/영점
 
-Z/X             좌/우 그립 토글
+Hand (홀드)
+  Z/C           왼손 3지(검지·중지·약지) 닫기/열기
+  X/V           오른손 3지 닫기/열기
+  A/S           왼손 엄지 닫기/열기
+  H/N           오른손 엄지 닫기/열기
+  (새끼손가락 항상 편 상태 / 오른손은 태스크 중 TASK 표시)
+
+P               캔 따르기 태스크 시작/중단
 F               카메라 추적 토글
 G               기즈모 토글
 R               캔 초기 위치로 리셋
@@ -43,6 +53,7 @@ ORIG_SCENE = os.path.join(ASSET_BASE, 'scene_ffw_sh5.xml')
 
 from robot.controller import TeleopController
 from robot.gui import ControlPanel
+from robot.task import CanPourTask
 
 # ── 렌더 / 물리 비율 설정 ──────────────────────────────────────────────
 # physics timestep 은 model.opt.timestep (보통 0.002s = 500 Hz)
@@ -101,6 +112,8 @@ def main():
     data  = mujoco.MjData(model)
 
     ctrl = TeleopController(model, data)
+    task = CanPourTask(model, data)
+    ctrl.task = task
 
     with mujoco.viewer.launch_passive(
         model, data,
@@ -114,12 +127,12 @@ def main():
         gui = ControlPanel(ctrl)
 
         frame_dt = 1.0 / RENDER_HZ
-        prev_t   = time.perf_counter()
 
         while viewer.is_running():
-            t0  = time.perf_counter()
-            dt  = min(t0 - prev_t, 0.05)
-            prev_t = t0
+            t0 = time.perf_counter()
+
+            # ── 자율 태스크 스텝 (렌더 프레임마다 1회) ───────────────
+            task.step(ctrl)
 
             # ── 물리 서브스텝 ─────────────────────────────────────────
             # IK 는 마지막 스텝에만 실행 (비용 절감)
