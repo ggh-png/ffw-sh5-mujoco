@@ -72,26 +72,29 @@ def build_scene() -> mujoco.MjModel:
     table.name = 'table'
     table.pos  = [0.8, 0, 0]
 
+    TABLE_H = 0.65   # 테이블 상면 높이 (m)
     top = table.add_geom()
     top.name = 'table_top'
     top.type = mujoco.mjtGeom.mjGEOM_BOX
     top.size = [0.30, 0.35, 0.02]
-    top.pos  = [0, 0, 0.42]
+    top.pos  = [0, 0, TABLE_H - 0.02]
     top.rgba = [0.60, 0.40, 0.20, 1]
 
+    leg_half = (TABLE_H - 0.04) / 2
     for i, (lx, ly) in enumerate([(-0.27, -0.32), (-0.27,  0.32),
                                     ( 0.27, -0.32), ( 0.27,  0.32)]):
         leg = table.add_geom()
         leg.name = f'table_leg{i+1}'
         leg.type = mujoco.mjtGeom.mjGEOM_BOX
-        leg.size = [0.02, 0.02, 0.21]
-        leg.pos  = [lx, ly, 0.21]
+        leg.size = [0.02, 0.02, leg_half]
+        leg.pos  = [lx, ly, leg_half]
         leg.rgba = [0.50, 0.30, 0.15, 1]
 
-    # 캔 (dynamic, freejoint)
+    # 캔 (dynamic, freejoint) — 테이블 위에 올려놓기 (can half-height = 0.055m)
+    CAN_Z = TABLE_H + 0.055
     can = wb.add_body()
     can.name = 'can'
-    can.pos  = [0.80, 0, 0.50]
+    can.pos  = [0.85, 0.15, CAN_Z]
 
     fj = can.add_freejoint()
     fj.name = 'can_free'
@@ -142,6 +145,7 @@ def main():
                 ctrl.update(sub_dt, run_ik=run_ik)
                 mujoco.mj_step(model, data)
                 ctrl.apply_floor_constraint()
+                ctrl.apply_spread_lock()
 
             # ── 렌더 ─────────────────────────────────────────────────
             ctrl.overlay(viewer)

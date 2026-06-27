@@ -242,12 +242,15 @@ class TeleopController:
         # XML default kp≈20 → fingers take ~2 s to close (too slow for interactive use).
         # kp=150 + matching biasprm[1] + kv=10 → ~0.3 s close time.
         _FIN_KP, _FIN_KV = 150.0, 10.0
+        _FIN_FORCE = 20.0   # N·m — XML default ±2 N·m is too weak to lift a can
         for _n in FIN_L + FIN_R:
             _a = try_aid(_n)
             if _a is not None:
                 model.actuator_gainprm[_a, 0] = _FIN_KP
                 model.actuator_biasprm[_a, 1] = -_FIN_KP  # position bias must match gain
                 model.actuator_biasprm[_a, 2] = -_FIN_KV
+                model.actuator_forcerange[_a, 0] = -_FIN_FORCE
+                model.actuator_forcerange[_a, 1] =  _FIN_FORCE
 
         # Joint addresses
         fj = jid('floating_base')
@@ -275,11 +278,42 @@ class TeleopController:
             for n in names:
                 i = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)
                 if i >= 0:
-                    res[n] = (model.jnt_qposadr[i], tuple(model.jnt_range[i]))
+                    res[n] = (model.jnt_qposadr[i], tuple(model.jnt_range[i]),
+                              model.jnt_dofadr[i])
             return res
 
         self._fin_l_info = fin_info(FIN_L)
         self._fin_r_info = fin_info(FIN_R)
+
+        # Spread joints (phase=0: joint5,9,13 per hand) have no actuator →
+        # lock them kinematically to 0° every step via qpos+qvel override.
+        def _spread_addrs(fin_info_dict):
+            out = []
+            for jname, info in fin_info_dict.items():
+                idx = int(jname.split('joint')[1])
+                # spread joints: index/middle/ring/pinky (5,9,13,17)
+                if idx in (5, 9, 13, 17):
+                    qadr, _, dofadr = info
+                    out.append((qadr, dofadr))
+            return out
+
+        self._spread_l = _spread_addrs(self._fin_l_info)
+        self._spread_r = _spread_addrs(self._fin_r_info)
+
+        # Thumb joint1 (abduction): forcerange too weak → kinematic lock at 0°.
+        # Thumb joint2 (MCP): forcerange too weak to hold 90° → kinematic lock.
+        # Lock values are updated each step from _thumb_l/r grip state.
+        def _thumb_fixed_addrs(fin_info_dict):
+            out = {}
+            for jname, info in fin_info_dict.items():
+                idx = int(jname.split('joint')[1])
+                if idx in (1, 2):
+                    qadr, (lo, hi), dofadr = info
+                    out[idx] = (qadr, dofadr, lo, hi)
+            return out
+
+        self._thumb_fixed_l = _thumb_fixed_addrs(self._fin_l_info)
+        self._thumb_fixed_r = _thumb_fixed_addrs(self._fin_r_info)
 
         # EE / shoulder bodies
         self._ee_l = bid('hx5_l_base')
@@ -337,6 +371,10 @@ class TeleopController:
         # Desired lift position (separate from qpos to prevent gravity sag)
         self._lift_des = 0.0
 
+        # Deferred can reset flag — set from key/GUI thread, applied in update()
+        # to avoid race condition with mj_step (segfault on rapid R presses).
+        self._pending_can_reset = False
+
         # FK state
         self._mode     = 'ik'
         self._fk_joint = 0
@@ -380,12 +418,29 @@ class TeleopController:
         self.d.qpos[qa + 3] = 1.0            # identity quaternion (yaw = 0)
         mujoco.mj_forward(self.m, self.d)
 
+        # J4 (elbow) default = -90°
+        for qadr, a, rng in [
+                (self._jl_qadrs[3], self._a_arm_l[3], self._jl_ranges[3]),
+                (self._jr_qadrs[3], self._a_arm_r[3], self._jr_ranges[3])]:
+            lo, hi = rng
+            val = float(np.clip(-math.pi / 2, lo, hi))
+            self.d.qpos[qadr] = val
+            self.d.ctrl[a] = val
+        mujoco.mj_forward(self.m, self.d)
+
         self._vx = self._yaw_rate = self._yaw_des = 0.0
+
+        # 리프트 디폴트 먼저 설정 → mj_forward → EE 위치 기반 IK 타겟 초기화
+        lo, hi = self._j_lift_range
+        self._lift_des = float(np.clip(-0.36, lo, hi))  # 디폴트 -360mm
+        self.d.qpos[self._j_lift_qadr] = self._lift_des
+        self.d.ctrl[self._a_lift]      = self._lift_des
+        mujoco.mj_forward(self.m, self.d)
+
         self._ik_tgt_l_base = self._world_to_base(self.d.xpos[self._ee_l].copy())
         self._ik_tgt_r_base = self._world_to_base(self.d.xpos[self._ee_r].copy())
         self._ik_tgt_l_quat = self.d.xquat[self._ee_l].copy()
         self._ik_tgt_r_quat = self.d.xquat[self._ee_r].copy()
-        self._lift_des = float(self.d.qpos[self._j_lift_qadr])
         self._grip_l = self._grip_r = 0.0
         self._thumb_l = self._thumb_r = 0.0
         self._mode = 'ik'
@@ -491,6 +546,10 @@ class TeleopController:
         freq = 1.0 / dt if dt > 1e-6 else self._freq_ema
         self._freq_ema = (1.0 - EMA_ALPHA) * self._freq_ema + EMA_ALPHA * freq
 
+        if self._pending_can_reset:
+            self._pending_can_reset = False
+            self._apply_can_reset()
+
         self._update_base(dt)
         self._update_lift(dt)
 
@@ -541,6 +600,31 @@ class TeleopController:
         self.base_world_pos = np.array([float(self.d.qpos[qa]),
                                         float(self.d.qpos[qa + 1]),
                                         float(self.d.qpos[qa + 2])])
+
+    def apply_spread_lock(self):
+        """Kinematically lock weak finger joints every mj_step.
+
+        - Spread (5,9,13,17): locked at 0° — actuator forcerange too weak.
+        - Thumb joint1 (abduction): locked at 0°.
+        - Thumb joint2 (MCP): locked at 90° + thumb-curl — forcerange too weak.
+        """
+        for qadr, dofadr in self._spread_l + self._spread_r:
+            self.d.qpos[qadr]   = 0.0
+            self.d.qvel[dofadr] = 0.0
+
+        for side, fixed, thumb in [
+                ('l', self._thumb_fixed_l, self._thumb_l),
+                ('r', self._thumb_fixed_r, self._thumb_r)]:
+            s = 1.0 if side == 'l' else -1.0
+            if 1 in fixed:
+                qadr, dofadr, lo, hi = fixed[1]
+                self.d.qpos[qadr]   = 0.0
+                self.d.qvel[dofadr] = 0.0
+            if 2 in fixed:
+                qadr, dofadr, lo, hi = fixed[2]
+                val = float(np.clip(s * math.radians(110), lo, hi))
+                self.d.qpos[qadr]   = val
+                self.d.qvel[dofadr] = 0.0
 
     def apply_floor_constraint(self):
         """Lock base z and set yaw from kinematic _yaw_des. Call after each mj_step.
@@ -748,18 +832,18 @@ class TeleopController:
         info = self._fin_l_info if side == 'l' else self._fin_r_info
         act  = self._a_fin_l    if side == 'l' else self._a_fin_r
 
-        for jname, (qadr, (lo, hi)) in info.items():
+        for jname, (qadr, (lo, hi), _dofadr) in info.items():
             a_id = act.get(jname)
             if a_id is None:
                 continue
             idx = int(jname.split('joint')[1])
 
             if idx == 1:
-                # 엄지 내전/외전: 중립 고정
+                # 엄지 내전/외전: 0° 고정
                 target = 0.0
             elif idx == 2:
-                # 엄지 MCP: L=0→+90°, R=0→-90°
-                target = s * (math.pi / 2) * thumb
+                # 엄지 MCP: 항상 110° 고정 (thumb 제어와 무관)
+                target = s * math.radians(110)
             elif idx in (3, 4):
                 # 엄지 PIP/DIP: L=0→-60°, R=0→+60°
                 target = s * (-math.pi / 3) * thumb
@@ -781,11 +865,15 @@ class TeleopController:
     # ── Can reset ────────────────────────────────────────────────────────
 
     def _reset_can(self):
+        # Only set flag here — actual reset applied in update() (main thread).
+        # Calling mj_forward directly from GLFW/GUI thread races with mj_step → segfault.
+        self._pending_can_reset = True
+
+    def _apply_can_reset(self):
         if self._can_qadr is None or self._can_init_qpos is None:
             return
         self.d.qpos[self._can_qadr: self._can_qadr + 7] = self._can_init_qpos
         self.d.qvel[self._can_vadr: self._can_vadr + 6] = 0.0
-        mujoco.mj_forward(self.m, self.d)
 
     # ── Fullscreen / window resize ───────────────────────────────────────
 
