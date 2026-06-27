@@ -66,7 +66,7 @@ YAW_MAX_SPD   = 1.20   # rad/s
 IK_SPEED      = 0.40   # m/s
 IK_ROT_SPEED  = 0.50   # rad/s — EE orientation control
 FK_SPEED      = 0.80   # rad/s
-GRIP_SPEED    = 1.50   # full range (0→1) per second
+GRIP_SPEED    = 3.00   # full range (0→1) per second — fast close for grasping
 LIFT_STEP     = 0.003  # m per update
 WHEEL_RADIUS  = 0.090  # m
 K_ACCEL       = 3.0
@@ -238,11 +238,18 @@ class TeleopController:
         self._a_fin_l = {n: try_aid(n) for n in FIN_L}
         self._a_fin_r = {n: try_aid(n) for n in FIN_R}
 
-        # Boost finger PD gains at runtime.
+        # ── Contact solver: noslip + more iterations for stable grasping ──────
+        # noslip_iterations=0 (default) allows contact slip → can slides out.
+        # Setting 20 dramatically improves grasp stability under load.
+        model.opt.iterations        = 200
+        model.opt.noslip_iterations = 20
+        model.opt.ls_iterations     = 100   # line-search iterations
+
+        # ── Finger actuator gains & forcerange ──────────────────────────────
         # XML default kp≈20 → fingers take ~2 s to close (too slow for interactive use).
         # kp=150 + matching biasprm[1] + kv=10 → ~0.3 s close time.
         _FIN_KP, _FIN_KV = 150.0, 10.0
-        _FIN_FORCE = 20.0   # N·m — XML default ±2 N·m is too weak to lift a can
+        _FIN_FORCE = 50.0   # N·m — ±20 sometimes insufficient; ±50 gives solid grip
         for _n in FIN_L + FIN_R:
             _a = try_aid(_n)
             if _a is not None:
@@ -251,6 +258,30 @@ class TeleopController:
                 model.actuator_biasprm[_a, 2] = -_FIN_KV
                 model.actuator_forcerange[_a, 0] = -_FIN_FORCE
                 model.actuator_forcerange[_a, 1] =  _FIN_FORCE
+
+        # ── Finger geom friction & condim ────────────────────────────────────
+        # Collect all bodies that have finger joints (includes phalanx bodies).
+        # condim=4 adds torsional friction (spin about contact normal) → prevents
+        # the can rotating in the hand.  Sliding friction raised to 2.0 (rubber grip).
+        _finger_bodies: set[int] = set()
+        for _jn in FIN_L + FIN_R:
+            _ji = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, _jn)
+            if _ji >= 0:
+                _bid = int(model.jnt_bodyid[_ji])
+                _finger_bodies.add(_bid)
+                _finger_bodies.add(int(model.body_parentid[_bid]))  # also parent
+
+        for _gi in range(model.ngeom):
+            if int(model.geom_bodyid[_gi]) in _finger_bodies:
+                model.geom_friction[_gi, 0] = 2.0   # sliding — was 1.0
+                model.geom_friction[_gi, 1] = 0.05  # torsional — was 0.005
+                model.geom_friction[_gi, 2] = 0.01  # rolling   — was 0.0001
+                model.geom_condim[_gi]      = 4     # sliding + torsional
+                # Stiffer contact: default solimp[0]=0.9 → near-rigid 0.99
+                model.geom_solimp[_gi, 0] = 0.97   # min impedance
+                model.geom_solimp[_gi, 1] = 0.999  # max impedance (near-rigid)
+                model.geom_solimp[_gi, 2] = 0.001  # damping margin
+                model.geom_solref[_gi, 0] = 0.005  # timeconst — stiffer (was 0.02)
 
         # Joint addresses
         fj = jid('floating_base')

@@ -59,7 +59,7 @@ from robot.task import CanPourTask
 # physics timestep 은 model.opt.timestep (보통 0.002s = 500 Hz)
 # 렌더는 ~60 Hz → 1프레임당 약 8 물리 스텝
 RENDER_HZ  = 60
-N_SUBSTEPS = 8   # 물리 스텝 수 per 렌더 프레임 (= 500/60 ≈ 8)
+N_SUBSTEPS = 16  # 물리 스텝 수 per 렌더 프레임 — 2× for better contact resolution
 
 
 def build_scene() -> mujoco.MjModel:
@@ -104,10 +104,17 @@ def build_scene() -> mujoco.MjModel:
     cg.type     = mujoco.mjtGeom.mjGEOM_CYLINDER
     cg.size     = [0.033, 0.055, 0]
     cg.rgba     = [0.85, 0.15, 0.15, 1]
-    cg.mass     = 0.35
-    cg.friction = [0.8, 0.005, 0.0001]
+    cg.mass     = 0.20          # lighter can — easier to lift (was 0.35 kg)
+    cg.friction = [2.0, 0.05, 0.01]  # rubber-grip surface (was 0.8, 0.005, 0.0001)
 
-    return spec.compile()
+    model = spec.compile()
+
+    # Post-compile: set can condim=4 (prevents can spinning in grasp)
+    _can_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, 'can_geom')
+    if _can_gid >= 0:
+        model.geom_condim[_can_gid] = 4
+
+    return model
 
 
 def main():
