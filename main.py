@@ -62,52 +62,9 @@ RENDER_HZ  = 60
 N_SUBSTEPS = 8   # 물리 스텝 수 per 렌더 프레임 (= 500/60 ≈ 8)
 
 
-def _find_body(root, name: str):
-    """MjSpec body tree 재귀 탐색 (next_body는 부모 인자가 필요)."""
-    if root.name == name:
-        return root
-    child = root.first_body()
-    while child:
-        found = _find_body(child, name)
-        if found:
-            return found
-        child = root.next_body(child)
-    return None
-
-
-def _add_palm_fill(spec, base_name: str):
-    """Palm body의 오목한 내부에 얇은 박스 collision geom을 추가.
-
-    hx5_base의 로컬 Z축 = 월드 X+ (전방, 캔 방향).
-    Palm face는 local Z ≈ +0.054 에 있고, 오목한 내부는 Z < 0.05 영역.
-    이 영역을 채우는 박스를 넣어 캔이 palm 내부로 파고드는 것을 방지한다.
-    """
-    body = _find_body(spec.worldbody, base_name)
-    if body is None:
-        return
-    # 박스 중심: local Z=0.02 (palm face Z=0.054 기준 내부)
-    # 크기: X×Y는 palm AABB와 동일, Z 방향 두께 4cm
-    g = body.add_geom()
-    g.type        = mujoco.mjtGeom.mjGEOM_BOX
-    g.pos         = [0.001, 0.004, 0.030]
-    g.size        = [0.023, 0.065, 0.033]  # 4.6×13×6.6 cm — palm→finger base + thumb side
-    g.contype     = 1
-    g.conaffinity = 1
-    g.group       = 3          # collision group (invisible in default view)
-    g.density     = 0          # massless — don't affect arm inertia
-    g.friction    = [2.0, 0.05, 0.01]
-    g.solimp      = [0.95, 0.99, 0.001, 0.5, 2]
-    g.rgba        = [0.2, 0.8, 0.2, 0.0]   # invisible (collision only)
-
-
 def build_scene() -> mujoco.MjModel:
     """FFW-SH5 scene에 table + can을 동적으로 추가."""
     spec = mujoco.MjSpec.from_file(ORIG_SCENE)
-
-    # Palm 내부 채움 geom (캔이 palm 오목부로 파고드는 것 방지)
-    _add_palm_fill(spec, 'hx5_l_base')
-    _add_palm_fill(spec, 'hx5_r_base')
-
     wb   = spec.worldbody
 
     # 테이블 (static)

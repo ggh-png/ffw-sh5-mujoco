@@ -276,13 +276,6 @@ class TeleopController:
                 model.geom_friction[_gi, 0] = 2.0   # sliding — was 1.0
                 model.geom_friction[_gi, 1] = 0.05  # torsional — was 0.005
                 model.geom_friction[_gi, 2] = 0.01  # rolling   — was 0.0001
-                if model.geom_contype[_gi] == 1:    # collision geoms only (not visual)
-                    # margin=0.006: 6mm force-field around each finger geom.
-                    # This closes the mesh-to-mesh junction gaps (typically 3-5mm)
-                    # so the can cannot slip through between adjacent link geoms.
-                    # solimp[1]=0.99: near-rigid at reference penetration depth.
-                    model.geom_solimp[_gi, 1] = 0.99
-                    model.geom_margin[_gi]     = 0.006
 
         # Joint addresses
         fj = jid('floating_base')
