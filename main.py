@@ -91,7 +91,7 @@ def build_scene() -> mujoco.MjModel:
         leg.rgba = [0.50, 0.30, 0.15, 1]
 
     # 캔 (dynamic, freejoint) — 테이블 위에 올려놓기 (can half-height = 0.055m)
-    CAN_HALF_H = 0.075             # 반높이 0.075m → 전체 높이 15cm
+    CAN_HALF_H = 0.110             # 반높이 0.110m → 전체 높이 22cm
     CAN_Z = TABLE_H + CAN_HALF_H
     can = wb.add_body()
     can.name = 'can'
