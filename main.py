@@ -89,8 +89,8 @@ def _add_palm_fill(spec, base_name: str):
     # 크기: X×Y는 palm AABB와 동일, Z 방향 두께 4cm
     g = body.add_geom()
     g.type        = mujoco.mjtGeom.mjGEOM_BOX
-    g.pos         = [0.001, 0.004, 0.02]
-    g.size        = [0.022, 0.055, 0.020]  # half-sizes: 4.4×11×4 cm
+    g.pos         = [0.001, 0.004, 0.030]
+    g.size        = [0.023, 0.065, 0.033]  # 4.6×13×6.6 cm — palm→finger base + thumb side
     g.contype     = 1
     g.conaffinity = 1
     g.group       = 3          # collision group (invisible in default view)
