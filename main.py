@@ -109,10 +109,12 @@ def build_scene() -> mujoco.MjModel:
 
     model = spec.compile()
 
-    # Post-compile: set can condim=4 (prevents can spinning in grasp)
+    # Post-compile contact tuning for can
     _can_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, 'can_geom')
     if _can_gid >= 0:
-        model.geom_condim[_can_gid] = 4
+        model.geom_condim[_can_gid]    = 4     # prevents can spinning in grasp
+        model.geom_solimp[_can_gid, 1] = 0.99  # stiffer (was 0.95)
+        model.geom_margin[_can_gid]    = 0.001 # 1mm early contact detection
 
     return model
 
