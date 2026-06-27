@@ -248,8 +248,8 @@ class TeleopController:
         # ── Finger actuator gains & forcerange ──────────────────────────────
         # XML default kp≈20 → fingers take ~2 s to close (too slow for interactive use).
         # kp=150 + matching biasprm[1] + kv=10 → ~0.3 s close time.
-        _FIN_KP, _FIN_KV = 150.0, 10.0
-        _FIN_FORCE = 50.0   # N·m — ±20 sometimes insufficient; ±50 gives solid grip
+        _FIN_KP, _FIN_KV = 300.0, 20.0
+        _FIN_FORCE = 150.0  # N·m
         for _n in FIN_L + FIN_R:
             _a = try_aid(_n)
             if _a is not None:
