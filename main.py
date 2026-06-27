@@ -62,10 +62,145 @@ RENDER_HZ  = 60
 N_SUBSTEPS = 8   # 물리 스텝 수 per 렌더 프레임 (= 500/60 ≈ 8)
 
 
+# ── Collision layer bit mask ──────────────────────────────────────────
+# bit 1 (=1): 기본 레이어 — arm mesh, table, 캔
+# bit 2 (=2): 손가락 캡슐 레이어 — 캡슐↔캡슐 충돌을 막고 캡슐↔캔만 허용
+#   캡슐:  contype=2, conaffinity=0  (다른 캡슐/arm 안 봄)
+#   캔:    conaffinity=3 (bit1+bit2) (캡슐도 봄)
+_LAYER_NORMAL = 1
+_LAYER_FINGER = 2
+
+
+def _find_body(root, name: str):
+    """MjSpec body tree 재귀 탐색."""
+    if root.name == name:
+        return root
+    child = root.first_body()
+    while child is not None:
+        found = _find_body(child, name)
+        if found:
+            return found
+        child = root.next_body(child)
+    return None
+
+
+def _collect_descendants(spec_body):
+    """spec_body 직계 + 하위 모든 body 재귀 수집 (spec_body 자신 제외)."""
+    out = []
+    child = spec_body.first_body()
+    while child is not None:
+        out.append(child)
+        out.extend(_collect_descendants(child))
+        child = spec_body.next_body(child)
+    return out
+
+
+def _replace_finger_mesh_collision(spec, model_ref):
+    """손가락 mesh collision geom → capsule 교체.
+
+    핵심: contype=2 / conaffinity=0 으로 캡슐끼리는 서로 충돌하지 않으면서
+    캔(conaffinity=3)과만 충돌한다. 이전 시도에서 그립이 망가진 원인이
+    바로 conaffinity=1로 설정된 캡슐들이 서로 밀어냈기 때문.
+
+    mesh AABB 최장 축 방향으로 capsule을 정렬한다.
+    """
+    for palm_name in ('hx5_l_base', 'hx5_r_base'):
+        palm_sb = _find_body(spec.worldbody, palm_name)
+        if palm_sb is None:
+            continue
+
+        for sb in _collect_descendants(palm_sb):
+            bname = sb.name
+            if not bname:
+                continue
+            bid = mujoco.mj_name2id(model_ref, mujoco.mjtObj.mjOBJ_BODY, bname)
+            if bid < 0:
+                continue
+
+            # ── 이 body의 mesh collision geom 찾기 ──────────────────
+            coll_gid = -1
+            for gi in range(model_ref.ngeom):
+                if (int(model_ref.geom_bodyid[gi]) == bid
+                        and model_ref.geom_contype[gi] == 1
+                        and model_ref.geom_type[gi] == mujoco.mjtGeom.mjGEOM_MESH):
+                    coll_gid = gi
+                    break
+            if coll_gid < 0:
+                continue
+
+            # ── mesh vertex → body frame 변환 ────────────────────────
+            gp    = model_ref.geom_pos[coll_gid]          # (3,) body-frame offset
+            gq    = model_ref.geom_quat[coll_gid]         # (4,) [w,x,y,z]
+            rot9  = np.zeros(9); mujoco.mju_quat2Mat(rot9, gq)
+            R     = rot9.reshape(3, 3)
+            mid   = int(model_ref.geom_dataid[coll_gid])
+            va    = model_ref.mesh_vertadr[mid]
+            nv    = model_ref.mesh_vertnum[mid]
+            raw   = model_ref.mesh_vert[va:va+nv].reshape(-1, 3)
+            verts = (R @ raw.T).T + gp                    # body-frame vertices
+
+            xs, xe = float(verts[:,0].min()), float(verts[:,0].max())
+            ys, ye = float(verts[:,1].min()), float(verts[:,1].max())
+            zs, ze = float(verts[:,2].min()), float(verts[:,2].max())
+            dx, dy, dz = xe-xs, ye-ys, ze-zs
+            cx, cy, cz = (xs+xe)/2, (ys+ye)/2, (zs+ze)/2
+
+            # ── 최장 축 → capsule 방향 결정 ──────────────────────────
+            # MuJoCo capsule 기본 장축 = local Z.
+            # 장축이 X면 90°@Y, Y면 -90°@X 회전.
+            if dx >= dy and dx >= dz:
+                r  = max(0.007, min(min(dy, dz) / 2 * 0.90, 0.016))
+                hl = max(0.005, dx / 2 - r * 0.5)
+                q  = [0.7071068, 0, 0.7071068, 0]   # Z→X: 90° around Y
+            elif dy >= dz:
+                r  = max(0.007, min(min(dx, dz) / 2 * 0.90, 0.016))
+                hl = max(0.005, dy / 2 - r * 0.5)
+                q  = [0.7071068, -0.7071068, 0, 0]  # Z→Y: -90° around X
+            else:
+                r  = max(0.007, min(min(dx, dy) / 2 * 0.90, 0.016))
+                hl = max(0.005, dz / 2 - r * 0.5)
+                q  = [1, 0, 0, 0]                   # Z: no rotation
+
+            # ── 기존 mesh collision geom 비활성화 ────────────────────
+            g_list = []
+            g = sb.first_geom()
+            while g is not None:
+                if g.group == 3:
+                    g_list.append(g)
+                try:    g = sb.next_geom(g)
+                except: break
+            for g in g_list:
+                g.contype = 0; g.conaffinity = 0
+
+            # ── capsule 추가 ─────────────────────────────────────────
+            cap             = sb.add_geom()
+            cap.type        = mujoco.mjtGeom.mjGEOM_CAPSULE
+            cap.pos         = [cx, cy, cz]
+            cap.quat        = q
+            cap.size        = [r, hl, 0]
+            cap.contype     = _LAYER_FINGER   # 2: finger layer
+            cap.conaffinity = 0               # 캡슐끼리 충돌 안 함
+            cap.group       = 3
+            cap.density     = 0               # 질량 기여 없음
+            cap.friction    = [2.0, 0.05, 0.01]
+            cap.solimp      = [0.95, 0.99, 0.001, 0.5, 2]
+            cap.margin      = 0.004           # 4mm early detection — gap 보완
+            cap.rgba        = [0.3, 0.7, 1.0, 0.0]
+
+
 def build_scene() -> mujoco.MjModel:
     """FFW-SH5 scene에 table + can을 동적으로 추가."""
+    # ── 1차 컴파일: mesh AABB 측정용 (원본 XML, table/can 없음) ──────────
+    _spec_ref  = mujoco.MjSpec.from_file(ORIG_SCENE)
+    _model_ref = _spec_ref.compile()
+
+    # ── 2차 컴파일: 실제 씬 구성 ─────────────────────────────────────────
     spec = mujoco.MjSpec.from_file(ORIG_SCENE)
-    wb   = spec.worldbody
+
+    # 손가락 mesh collision → capsule 교체 (gap-free + self-collision-free)
+    _replace_finger_mesh_collision(spec, _model_ref)
+
+    wb = spec.worldbody
 
     # 테이블 (static)
     table = wb.add_body()
@@ -90,7 +225,7 @@ def build_scene() -> mujoco.MjModel:
         leg.pos  = [lx, ly, leg_half]
         leg.rgba = [0.50, 0.30, 0.15, 1]
 
-    # 캔 (dynamic, freejoint) — 테이블 위에 올려놓기 (can half-height = 0.055m)
+    # 캔 (dynamic, freejoint) — 테이블 위에 올려놓기
     CAN_HALF_H = 0.110             # 반높이 0.110m → 전체 높이 22cm
     CAN_Z = TABLE_H + CAN_HALF_H
     can = wb.add_body()
@@ -105,17 +240,20 @@ def build_scene() -> mujoco.MjModel:
     cg.type     = mujoco.mjtGeom.mjGEOM_CYLINDER
     cg.size     = [0.040, CAN_HALF_H, 0]
     cg.rgba     = [0.85, 0.15, 0.15, 1]
-    cg.mass     = 0.20          # lighter can — easier to lift (was 0.35 kg)
-    cg.friction = [2.0, 0.05, 0.01]  # rubber-grip surface (was 0.8, 0.005, 0.0001)
+    cg.mass     = 0.20
+    cg.friction = [2.0, 0.05, 0.01]
 
     model = spec.compile()
 
-    # Post-compile contact tuning for can
+    # ── Post-compile: 캔 contact 파라미터 ────────────────────────────────
     _can_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, 'can_geom')
     if _can_gid >= 0:
-        model.geom_condim[_can_gid]    = 4     # prevents can spinning in grasp
-        model.geom_solimp[_can_gid, 1] = 0.99  # stiffer (was 0.95)
-        model.geom_margin[_can_gid]    = 0.001 # 1mm early contact detection
+        model.geom_condim[_can_gid]       = 4      # torsional friction (spin 방지)
+        model.geom_solimp[_can_gid, 1]   = 0.99
+        model.geom_margin[_can_gid]       = 0.001
+        # conaffinity = bit1(normal) | bit2(finger capsules)
+        # → 캔이 arm mesh(bit1)와 손가락 캡슐(bit2) 모두와 충돌
+        model.geom_conaffinity[_can_gid]  = _LAYER_NORMAL | _LAYER_FINGER
 
     return model
 
