@@ -95,6 +95,29 @@ def _collect_descendants(spec_body):
     return out
 
 
+def _add_palm_fill(spec, base_name: str):
+    """Palm body의 오목한 내부를 BOX geom으로 채워 캔 관통 방지.
+
+    hx5_*_base의 로컬 Z축 = 월드 X+ (전방, 캔 방향).
+    Palm 오목 내부(Z<0.054)를 채워 캔이 GJK 사각지대로 파고드는 것 방지.
+    contype=1(normal layer) 로 설정해 캔(conaffinity=3)과 충돌한다.
+    """
+    body = _find_body(spec.worldbody, base_name)
+    if body is None:
+        return
+    g = body.add_geom()
+    g.type        = mujoco.mjtGeom.mjGEOM_BOX
+    g.pos         = [0.001, 0.004, 0.030]
+    g.size        = [0.023, 0.065, 0.033]  # Z: -0.003~+0.063, Y: ±6.9cm
+    g.contype     = _LAYER_NORMAL
+    g.conaffinity = _LAYER_NORMAL
+    g.group       = 3
+    g.density     = 0
+    g.friction    = [2.0, 0.05, 0.01]
+    g.solimp      = [0.95, 0.99, 0.001, 0.5, 2]
+    g.rgba        = [0.2, 0.8, 0.2, 0.0]
+
+
 def _replace_finger_mesh_collision(spec, model_ref):
     """손가락 mesh collision geom → capsule 교체.
 
@@ -184,7 +207,7 @@ def _replace_finger_mesh_collision(spec, model_ref):
             cap.density     = 0               # 질량 기여 없음
             cap.friction    = [2.0, 0.05, 0.01]
             cap.solimp      = [0.95, 0.99, 0.001, 0.5, 2]
-            cap.margin      = 0.004           # 4mm early detection — gap 보완
+            cap.margin      = 0.006           # 6mm early detection — gap 보완
             cap.rgba        = [0.3, 0.7, 1.0, 0.0]
 
 
@@ -199,6 +222,10 @@ def build_scene() -> mujoco.MjModel:
 
     # 손가락 mesh collision → capsule 교체 (gap-free + self-collision-free)
     _replace_finger_mesh_collision(spec, _model_ref)
+
+    # Palm body 오목 내부 채움 (concave mesh → GJK 사각지대 보완)
+    _add_palm_fill(spec, 'hx5_l_base')
+    _add_palm_fill(spec, 'hx5_r_base')
 
     wb = spec.worldbody
 
