@@ -249,7 +249,7 @@ class TeleopController:
         # XML default kp≈20 → fingers take ~2 s to close (too slow for interactive use).
         # kp=150 + matching biasprm[1] + kv=10 → ~0.3 s close time.
         _FIN_KP, _FIN_KV = 300.0, 20.0
-        _FIN_FORCE = 150.0  # N·m
+        _FIN_FORCE = 5.0   # N·m — contact stiffness ~245kN/m, 5N·m/0.02m=250N → ~1mm penetration
         for _n in FIN_L + FIN_R:
             _a = try_aid(_n)
             if _a is not None:

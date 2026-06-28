@@ -169,19 +169,20 @@ def _replace_finger_mesh_collision(spec, model_ref):
             cx, cy, cz = (xs+xe)/2, (ys+ye)/2, (zs+ze)/2
 
             # ── 최장 축 → capsule 방향 결정 ──────────────────────────
+            # radius: mesh 단면의 1.10배 (visual mesh 밖까지 커버 → 관통 방지)
+            # hl: AABB 반길이 + r*0.5 (끝단 gap 없애기 위해 약간 연장)
             # MuJoCo capsule 기본 장축 = local Z.
-            # 장축이 X면 90°@Y, Y면 -90°@X 회전.
             if dx >= dy and dx >= dz:
-                r  = max(0.007, min(min(dy, dz) / 2 * 0.90, 0.016))
-                hl = max(0.005, dx / 2 - r * 0.5)
+                r  = max(0.008, min(min(dy, dz) / 2 * 1.10, 0.020))
+                hl = max(0.005, dx / 2 + r * 0.3)
                 q  = [0.7071068, 0, 0.7071068, 0]   # Z→X: 90° around Y
             elif dy >= dz:
-                r  = max(0.007, min(min(dx, dz) / 2 * 0.90, 0.016))
-                hl = max(0.005, dy / 2 - r * 0.5)
+                r  = max(0.008, min(min(dx, dz) / 2 * 1.10, 0.020))
+                hl = max(0.005, dy / 2 + r * 0.3)
                 q  = [0.7071068, -0.7071068, 0, 0]  # Z→Y: -90° around X
             else:
-                r  = max(0.007, min(min(dx, dy) / 2 * 0.90, 0.016))
-                hl = max(0.005, dz / 2 - r * 0.5)
+                r  = max(0.008, min(min(dx, dy) / 2 * 1.10, 0.020))
+                hl = max(0.005, dz / 2 + r * 0.3)
                 q  = [1, 0, 0, 0]                   # Z: no rotation
 
             # ── 기존 mesh collision geom 비활성화 ────────────────────
