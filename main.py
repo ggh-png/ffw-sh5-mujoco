@@ -202,8 +202,8 @@ def _replace_finger_mesh_collision(spec, model_ref):
             cap.pos         = [cx, cy, cz]
             cap.quat        = q
             cap.size        = [r, hl, 0]
-            cap.contype     = _LAYER_NORMAL   # 1: standard layer
-            cap.conaffinity = _LAYER_NORMAL   # 1: standard layer
+            cap.contype     = _LAYER_FINGER   # 2: finger-capsule layer only
+            cap.conaffinity = 0               # 캡슐끼리 충돌 안 함 (finger self-collision 차단)
             cap.group       = 3
             cap.density     = 0               # 질량 기여 없음
             cap.friction    = [2.0, 0.05, 0.01]
@@ -264,24 +264,24 @@ def build_scene() -> mujoco.MjModel:
     fj.name = 'can_free'
 
     cg = can.add_geom()
-    cg.name     = 'can_geom'
-    cg.type     = mujoco.mjtGeom.mjGEOM_CYLINDER
-    cg.size     = [0.040, CAN_HALF_H, 0]
-    cg.rgba     = [0.85, 0.15, 0.15, 1]
-    cg.mass     = 0.20
-    cg.friction = [2.0, 0.05, 0.01]
+    cg.name        = 'can_geom'
+    cg.type        = mujoco.mjtGeom.mjGEOM_CYLINDER
+    cg.size        = [0.040, CAN_HALF_H, 0]
+    cg.rgba        = [0.85, 0.15, 0.15, 1]
+    cg.mass        = 0.20
+    cg.friction    = [2.0, 0.05, 0.01]
+    # conaffinity=3: bit1(normal layer, arm/table) + bit2(finger capsule layer)
+    # 캔이 양쪽 레이어를 모두 인식 — spec에서 설정해야 broadphase가 정확히 작동
+    cg.conaffinity = _LAYER_NORMAL | _LAYER_FINGER   # = 3
 
     model = spec.compile()
 
     # ── Post-compile: 캔 contact 파라미터 ────────────────────────────────
     _can_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, 'can_geom')
     if _can_gid >= 0:
-        model.geom_condim[_can_gid]       = 4      # torsional friction (spin 방지)
-        model.geom_solimp[_can_gid, 1]   = 0.99
-        model.geom_margin[_can_gid]       = 0.001
-        # conaffinity = bit1(normal) | bit2(finger capsules)
-        # → 캔이 arm mesh(bit1)와 손가락 캡슐(bit2) 모두와 충돌
-        model.geom_conaffinity[_can_gid]  = _LAYER_NORMAL
+        model.geom_condim[_can_gid]     = 4      # torsional friction (spin 방지)
+        model.geom_solimp[_can_gid, 1] = 0.99
+        model.geom_margin[_can_gid]     = 0.001
 
     return model
 
