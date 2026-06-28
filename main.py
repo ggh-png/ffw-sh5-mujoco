@@ -201,8 +201,8 @@ def _replace_finger_mesh_collision(spec, model_ref):
             cap.pos         = [cx, cy, cz]
             cap.quat        = q
             cap.size        = [r, hl, 0]
-            cap.contype     = _LAYER_FINGER   # 2: finger layer
-            cap.conaffinity = 0               # 캡슐끼리 충돌 안 함
+            cap.contype     = _LAYER_NORMAL   # 1: standard layer
+            cap.conaffinity = _LAYER_NORMAL   # 1: standard layer
             cap.group       = 3
             cap.density     = 0               # 질량 기여 없음
             cap.friction    = [2.0, 0.05, 0.01]
@@ -280,7 +280,7 @@ def build_scene() -> mujoco.MjModel:
         model.geom_margin[_can_gid]       = 0.001
         # conaffinity = bit1(normal) | bit2(finger capsules)
         # → 캔이 arm mesh(bit1)와 손가락 캡슐(bit2) 모두와 충돌
-        model.geom_conaffinity[_can_gid]  = _LAYER_NORMAL | _LAYER_FINGER
+        model.geom_conaffinity[_can_gid]  = _LAYER_NORMAL
 
     return model
 
